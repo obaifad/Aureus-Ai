@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 9+ (API 28+) blocks plain http:// by default. The MT5 bridge
+  server (bridge/mt5_bridge_server.py) is a local Python process on the
+  user's own PC reached over their home/office LAN or the 10.0.2.2
+  emulator alias — it is plain HTTP by design (see AppConfig.
+  bridgeBaseUrl), not a public endpoint, so cleartext is allowed here
+  rather than silently failing every real-device bridge connection.
+  Yahoo Finance/Anthropic/Telegram all use https:// already and are
+  unaffected by this either way.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

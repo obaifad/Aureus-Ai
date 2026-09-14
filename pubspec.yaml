@@ -1,0 +1,62 @@
+name: aureus_ai
+description: "Aureus AI — Automated XAUUSD Trading Assistant & Signal Generator"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+
+  # Networking (talking to the MT5 bridge server + the AI API)
+  http: ^1.2.1
+
+  # Local state / storage
+  shared_preferences: ^2.2.3
+  provider: ^6.1.2
+
+  # Share/export System Logs as text (SystemLogsScreen). Clipboard copy
+  # uses Flutter's built-in services.dart — no extra package needed.
+  share_plus: ^10.1.4
+
+  # Local push notifications for new trade signals
+  flutter_local_notifications: ^17.2.2
+
+  # Keeps SignalChecker polling on a Timer while the app is backgrounded/
+  # closed (Android/iOS) — see lib/services/monitor_task_handler.dart.
+  flutter_foreground_task: ^8.13.0
+
+  # Environment variables (API keys, bridge URL, Telegram token)
+  flutter_dotenv: ^5.1.0
+
+  # Date/number formatting
+  intl: ^0.19.0
+
+  # Persistent, cross-isolate System Logs file (AppLogger).
+  path_provider: ^2.1.4
+
+  # Iterable.firstOrNull (PriceAlertService).
+  collection: ^1.18.0
+
+  # Sub-second tick streaming from the MT5 bridge's /stream/ticks
+  # WebSocket endpoint (TickStreamService).
+  web_socket_channel: ^3.0.1
+
+  # Embeds the real, official TradingView chart widget (TradingViewChart
+  # Screen, 2026-09-13) as a plain WebView — chosen over webview_flutter
+  # because it's one unified API across Android AND Windows desktop
+  # (via WebView2) rather than two separate plugins with different APIs.
+  flutter_inappwebview: ^6.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - .env
