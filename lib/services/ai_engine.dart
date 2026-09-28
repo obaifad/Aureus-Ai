@@ -33,7 +33,7 @@ detected the following confluence-based setup:
 - Timeframe: ${setup.timeframeLabel}
 - Entry: ${setup.entry}
 - Stop Loss: ${setup.stopLoss}
-- Take Profit: ${setup.takeProfit} (R:R = 1:${AppConfig.riskRewardRatio.toStringAsFixed(0)})
+- Take Profit: ${setup.takeProfit} (R:R = 1:${AppConfig.riskRewardRatio.toStringAsFixed(1)})
 - Confirmation pattern: ${setup.pattern.name}
 
 Write exactly 2 short bullet points (each under 20 words) explaining the
@@ -112,7 +112,7 @@ just the two bullets.
     final dir = setup.direction == TradeDirection.buy ? 'bullish' : 'bearish';
     return '• Price reacted at the trendline/S/R confluence with a $dir '
         '${setup.pattern.shapeLabel} confirmation.\n'
-        '• Setup offers a clean 1:${AppConfig.riskRewardRatio.toStringAsFixed(0)} '
+        '• Setup offers a clean 1:${AppConfig.riskRewardRatio.toStringAsFixed(1)} '
         'risk-to-reward from the confirmation candle close.';
   }
 }

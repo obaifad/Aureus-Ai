@@ -92,6 +92,7 @@ class HomeScreen extends StatelessWidget {
                         onTap: () => Navigator.of(context).push(
                           MaterialPageRoute(builder: (_) => SignalDetailScreen(setup: setup)),
                         ),
+                        onCloseTrade: () => monitor.closeTradeManually(setup.uid),
                       );
                     },
                   ),

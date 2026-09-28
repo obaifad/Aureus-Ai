@@ -15,7 +15,14 @@ import 'yahoo_finance_data_service.dart';
 /// time] is the candle OPEN time in real UTC, and the LAST element may be
 /// the still-forming candle.
 abstract class DataService {
-  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300});
+  /// [symbol] overrides the default instrument (XAUUSD/[AppConfig.
+  /// brokerSymbol]) this data source normally serves — added 2026-09-18 for
+  /// DxyFilterService, the only caller that ever passes it. Every
+  /// implementation must accept it even where it isn't meaningful (Mock),
+  /// or reject it explicitly rather than silently ignoring it (TwelveData —
+  /// see TwelveDataDataService.getCandles), so a caller can never end up
+  /// with the wrong instrument's candles under an unrelated label.
+  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300, String? symbol});
 
   /// Factory: picks the mock generator or the real (failover-aware) client
   /// based on AppConfig.useMockData.
@@ -37,9 +44,9 @@ Map<String, String> bridgeHeaders() => {
 /// returning them.
 class Mt5BridgeDataService implements DataService {
   @override
-  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300}) async {
+  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300, String? symbol}) async {
     final uri = Uri.parse('${AppConfig.bridgeBaseUrl}/candles').replace(queryParameters: {
-      'symbol': AppConfig.brokerSymbol,
+      'symbol': symbol ?? AppConfig.brokerSymbol,
       'timeframe': timeframeMinutes.toString(),
       'count': count.toString(),
     });
@@ -53,6 +60,27 @@ class Mt5BridgeDataService implements DataService {
 
     final List<dynamic> raw = jsonDecode(response.body) as List<dynamic>;
     return raw.map((e) => Candle.fromJson(e as Map<String, dynamic>)).toList();
+  }
+
+  /// Auto-discovers a broker Market Watch symbol name matching [query] via
+  /// the bridge's /symbols endpoint (2026-09-18, for DxyFilterService — the
+  /// same problem [AppConfig.brokerSymbol]'s own doc comment describes for
+  /// gold: brokers rename/suffix an index just as inconsistently, e.g.
+  /// "USDX", "DXY", "DXY.cash"). Returns null on ANY failure (bridge down,
+  /// no match, request error) rather than throwing — every caller here
+  /// always has a further fallback or an explicit bypass for "couldn't
+  /// resolve", so a thrown exception would just be extra ceremony.
+  Future<String?> findSymbol(String query) async {
+    try {
+      final uri = Uri.parse('${AppConfig.bridgeBaseUrl}/symbols').replace(queryParameters: {'query': query});
+      final response = await http.get(uri, headers: bridgeHeaders()).timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) return null;
+      final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+      final matches = (decoded['matches'] as List?)?.cast<String>() ?? const <String>[];
+      return matches.isEmpty ? null : matches.first;
+    } catch (_) {
+      return null;
+    }
   }
 }
 
@@ -88,7 +116,32 @@ class FailoverDataService implements DataService {
   }
 
   @override
-  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300}) async {
+  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300, String? symbol}) async {
+    // Non-default symbol (2026-09-18, DxyFilterService): only the bridge
+    // and Yahoo are trusted to serve an arbitrary ticker — TwelveData's own
+    // client hardcodes 'XAU/USD' and rejects anything else (see
+    // TwelveDataDataService.getCandles) — and Bridge-Only Mode's "never
+    // silently substitute a different price source" intent is about the
+    // instrument actually being TRADED, which this isn't, so it doesn't
+    // apply here. Kept entirely separate from the default-symbol chain
+    // below (including its ConnectionStatusService reporting, which stays
+    // scoped to the real XAUUSD feed status) to guarantee zero behavior
+    // change for every existing caller that never passes [symbol].
+    if (symbol != null) {
+      if (!AppConfig.disableMt5Bridge) {
+        try {
+          final candles = await _bridge.getCandles(timeframeMinutes: timeframeMinutes, count: count, symbol: symbol);
+          _noteSuccess('MT5 Bridge ($symbol)');
+          return candles;
+        } catch (e) {
+          _noteFailure('MT5 Bridge ($symbol)', e);
+        }
+      }
+      final candles = await _yahoo.getCandles(timeframeMinutes: timeframeMinutes, count: count, symbol: symbol);
+      _noteSuccess('Yahoo ($symbol)');
+      return candles;
+    }
+
     if (!AppConfig.disableMt5Bridge) {
       try {
         final candles = await _bridge.getCandles(timeframeMinutes: timeframeMinutes, count: count);
@@ -98,6 +151,12 @@ class FailoverDataService implements DataService {
       } catch (e) {
         _noteFailure('MT5 Bridge', e);
       }
+    }
+    if (AppConfig.bridgeOnly) {
+      // Bridge-Only Mode (AppConfig.bridgeOnly) — never silently substitute
+      // a different (non-broker) price source; surface the outage instead.
+      ConnectionStatusService.instance.report(FeedSource.disconnected);
+      throw DataServiceException('MT5 bridge unreachable (Bridge-Only Mode — TwelveData/Yahoo fallback disabled)');
     }
     try {
       final candles = await _twelveData.getCandles(timeframeMinutes: timeframeMinutes, count: count);
@@ -127,7 +186,12 @@ class MockDataService implements DataService {
   final Random _rng = Random(42);
 
   @override
-  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300}) async {
+  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300, String? symbol}) async {
+    // [symbol] is accepted (interface requirement) but not honored — there
+    // is nothing to simulate for a second instrument, and DxyFilterService
+    // bypasses itself entirely under AppConfig.useMockData for exactly this
+    // reason (see its own doc comment), so this is never reached with a
+    // non-null value in practice.
     await Future.delayed(const Duration(milliseconds: 150));
 
     final List<Candle> candles = [];

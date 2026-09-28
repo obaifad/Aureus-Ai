@@ -74,6 +74,34 @@ class NewsCalendarService {
     }
   }
 
+  /// News Filter (2026-09-22, Breakout/Momentum spec point 8): the
+  /// high-impact USD event currently inside a [blackout]-wide window
+  /// either side of now (CPI, NFP, FOMC, Rate decisions, PCE — the feed is
+  /// already filtered to high-impact USD, which is exactly that set), or
+  /// null when the window is clear.
+  ///
+  /// Checked BOTH directions on purpose: the minutes AFTER a release are
+  /// where the spec's own failure mode lives ("خبر واحد يمكن أن ينتج
+  /// breakout ضخماً ثم reversal سريعاً") — the spike breaks every level on
+  /// the chart and then hands it all back.
+  ///
+  /// Returns null on any failure to read the calendar (feed down, no
+  /// cache, mock mode), i.e. it never blocks trading just because the news
+  /// feed itself is unavailable — same fail-open policy as DxyFilterService.
+  Future<EconomicEvent?> blackoutEvent(Duration blackout) async {
+    try {
+      final events = await upcomingHighImpactUsd();
+      if (events.isEmpty) return null;
+      final now = DateTime.now().toUtc();
+      for (final event in events) {
+        if (event.timeUtc.difference(now).abs() <= blackout) return event;
+      }
+    } catch (e) {
+      AppLogger.log('News calendar: blackout check failed ($e) — not blocking');
+    }
+    return null;
+  }
+
   /// Events starting within the next 15 minutes that haven't been announced.
   Future<List<EconomicEvent>> dueForAdvanceNotice() async {
     final events = await upcomingHighImpactUsd();

@@ -124,8 +124,9 @@ class ImpulseCorrectionEngine {
   /// rather than re-detected here, so both strategies agree on what those
   /// mean.
   bool _touchesBrokenZoneOrObFvg(List<Candle> candles, Candle last, List<HtfZone> htfZones) {
-    final nearest = _ta.findNearestZone(htfZones, last.close);
-    if (nearest != null && (last.close - nearest.price).abs() <= AppConfig.interestZoneBufferDollars) {
+    // Interest Area distance requirement removed (2026-09-14, explicit
+    // request) — any nearest zone counts, regardless of current distance.
+    if (_ta.findNearestZone(htfZones, last.close) != null) {
       return true;
     }
     for (final ob in _ict.unmitigatedOrderBlocks(candles)) {
@@ -137,17 +138,14 @@ class ImpulseCorrectionEngine {
     return false;
   }
 
-  /// Same absorption definition as TaEngine.find15mAbsorptionTrigger, but
-  /// generic to any timeframe (no "must be a closed 15M candle" gate),
-  /// since ICI isn't 15M-exclusive.
-  CandlePattern _classifyAbsorption(List<Candle> candles, int index) {
-    if (index < 1) return CandlePattern.none;
-    final curr = candles[index];
-    final prev = candles[index - 1];
-    if (curr.isBullish && prev.isBearish && prev.close <= curr.open) return CandlePattern.bullishAbsorption;
-    if (curr.isBearish && prev.isBullish && prev.close > curr.open) return CandlePattern.bearishAbsorption;
-    return CandlePattern.none;
-  }
+  /// Same shared absorption classifier the HTF Retest Protocol's
+  /// confirmation check uses (TaEngine.classifyStrongAbsorption) —
+  /// including its strength filter (2026-09-17): a weak / failed
+  /// Absorption returns [CandlePattern.none], so ICI never fires an entry
+  /// on one either. Generic to any timeframe (no "must be a closed 15M
+  /// candle" gate), since ICI isn't 15M-exclusive.
+  CandlePattern _classifyAbsorption(List<Candle> candles, int index) =>
+      _ta.classifyStrongAbsorption(candles, index);
 
   /// Correction Termination Trigger #3 — a small structural break: the
   /// confirmation candle's close breaks back past the correction phase's

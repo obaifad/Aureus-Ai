@@ -12,6 +12,10 @@ Windows machine as your MT5 terminal and exposes:
   GET  /tick                 - latest bid/ask, real UTC(X-API-Key)
   WS   /stream/ticks         - live ticks + heartbeats (?api_key=)
   POST /ai-commentary        - Anthropic proxy         (X-API-Key)
+  GET  /positions            - open positions          (X-API-Key)
+  POST /order/open           - open a market order      (X-API-Key)
+  POST /order/close_partial  - partially close a position (X-API-Key)
+  POST /order/modify_sl      - move a position's SL/TP  (X-API-Key)
 
 Timestamps: MT5 returns times in the BROKER SERVER's timezone (commonly
 GMT+2/GMT+3) as if they were UTC. This server detects that offset from
@@ -158,6 +162,31 @@ def _select_symbol(symbol: str) -> None:
             raise HTTPException(404, f"Symbol '{symbol}' not found or not enabled in MT5.")
 
 
+# ENUM_SYMBOL_TRADE_EXECUTION filling-mode bitmask (symbol_info().filling_mode)
+# — NOT exposed as named constants by the MetaTrader5 python package, unlike
+# the ORDER_FILLING_* values actually sent in an order request. Confirmed
+# 2026-09-21 against MEXAtlantic-Demo/XAUUSD (filling_mode == 1, i.e. ONLY
+# FOK — every order this bridge sent with the previously hardcoded IOC was
+# rejected with retcode 10030 "Unsupported filling mode").
+_SYMBOL_FILLING_FOK = 1
+_SYMBOL_FILLING_IOC = 2
+
+
+def _pick_filling_mode(symbol: str) -> int:
+    """Picks a filling mode the SYMBOL actually supports rather than
+    assuming every broker/instrument allows IOC — brokers differ, and
+    sending one the symbol doesn't support fails the whole order with
+    retcode 10030 before it ever reaches the market."""
+    with MT5_LOCK:
+        info = mt5.symbol_info(symbol)
+    mode = info.filling_mode if info is not None else 0
+    if mode & _SYMBOL_FILLING_IOC:
+        return mt5.ORDER_FILLING_IOC
+    if mode & _SYMBOL_FILLING_FOK:
+        return mt5.ORDER_FILLING_FOK
+    return mt5.ORDER_FILLING_RETURN
+
+
 # ---------------------------------------------------------------------------
 # Tick hub: ONE poller per symbol, broadcasting to every WebSocket client
 # ---------------------------------------------------------------------------
@@ -275,6 +304,52 @@ class AiCommentaryOut(BaseModel):
     text: str
 
 
+class PositionOut(BaseModel):
+    ticket: int
+    symbol: str
+    type: str  # "buy" | "sell"
+    volume: float
+    price_open: float
+    sl: float
+    tp: float
+    profit: float
+
+
+class OrderOpenIn(BaseModel):
+    symbol: str
+    direction: str  # "buy" | "sell"
+    volume: float
+    stop_loss: float
+    take_profit: float
+    deviation: int = 20
+    magic: int = 20260920  # Aureus AI auto-trading magic number
+
+
+class OrderOpenOut(BaseModel):
+    success: bool
+    ticket: Optional[int] = None
+    price: Optional[float] = None
+    error: Optional[str] = None
+
+
+class ClosePartialIn(BaseModel):
+    ticket: int
+    volume: float
+    deviation: int = 20
+
+
+class ModifySlIn(BaseModel):
+    ticket: int
+    stop_loss: float
+    take_profit: Optional[float] = None
+
+
+class OrderActionOut(BaseModel):
+    success: bool
+    price: Optional[float] = None
+    error: Optional[str] = None
+
+
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     """No-op when BRIDGE_API_KEY is unset (LAN testing). Set it before
     exposing this server beyond your local network."""
@@ -327,6 +402,154 @@ def account():
         "currency": info.currency,
         "trade_allowed": info.trade_allowed,
     }
+
+
+@app.get("/positions", response_model=List[PositionOut], dependencies=[Depends(require_api_key)])
+def get_positions(symbol: str = Query(default="XAUUSD")):
+    """Single Active Position Guard (Aureus AI, 2026-09-20): every currently
+    OPEN position for [symbol] — regardless of magic number, so a position
+    opened manually in the terminal blocks a new auto-signal exactly the
+    same as one this app opened itself."""
+    ensure_connected()
+    with MT5_LOCK:
+        positions = mt5.positions_get(symbol=symbol) or ()
+    return [
+        PositionOut(
+            ticket=p.ticket,
+            symbol=p.symbol,
+            type="buy" if p.type == mt5.POSITION_TYPE_BUY else "sell",
+            volume=float(p.volume),
+            price_open=float(p.price_open),
+            sl=float(p.sl),
+            tp=float(p.tp),
+            profit=float(p.profit),
+        )
+        for p in positions
+    ]
+
+
+@app.post("/order/open", response_model=OrderOpenOut, dependencies=[Depends(require_api_key)])
+def order_open(order: OrderOpenIn):
+    """Opens a REAL market order (Aureus AI Dynamic Position Sizing +
+    Auto-Trading, 2026-09-20) — only ever called by the app when
+    ENABLE_AUTO_TRADING=true and every local safety gate (Single Active
+    Position Guard, Live Spread Protection, Confluence Score, ...) already
+    passed. Volume/SL/TP are computed client-side and trusted as given;
+    this endpoint only executes and reports what the broker actually did."""
+    ensure_connected()
+    _select_symbol(order.symbol)
+
+    order_type = mt5.ORDER_TYPE_BUY if order.direction.lower() == "buy" else mt5.ORDER_TYPE_SELL
+    filling = _pick_filling_mode(order.symbol)
+    with MT5_LOCK:
+        tick = mt5.symbol_info_tick(order.symbol)
+        if tick is None:
+            return OrderOpenOut(success=False, error=f"No tick for {order.symbol}: {mt5.last_error()}")
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": order.symbol,
+            "volume": order.volume,
+            "type": order_type,
+            "price": price,
+            "sl": order.stop_loss,
+            "tp": order.take_profit,
+            "deviation": order.deviation,
+            "magic": order.magic,
+            "comment": "Aureus AI auto-trade",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling,
+        }
+        result = mt5.order_send(request)
+
+    if result is None:
+        return OrderOpenOut(success=False, error=f"order_send returned None: {mt5.last_error()}")
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        log.warning("order_send rejected: retcode=%s comment=%s", result.retcode, result.comment)
+        return OrderOpenOut(success=False, error=f"retcode {result.retcode}: {result.comment}")
+
+    log.info("Order opened: ticket=%s %s %s lots @ %s", result.order, order.direction, order.volume, result.price)
+    return OrderOpenOut(success=True, ticket=result.order, price=float(result.price))
+
+
+@app.post("/order/close_partial", response_model=OrderActionOut, dependencies=[Depends(require_api_key)])
+def order_close_partial(req: ClosePartialIn):
+    """Automatic Partial Take-Profit (Aureus AI, 2026-09-20): closes [volume]
+    lots of an existing position by sending an opposite-direction deal
+    against it (position ticket set) — MT5's own mechanism for a partial
+    close; the remaining volume stays open under the same ticket."""
+    ensure_connected()
+    with MT5_LOCK:
+        positions = mt5.positions_get(ticket=req.ticket) or ()
+    if not positions:
+        return OrderActionOut(success=False, error=f"Position #{req.ticket} not found (already closed?)")
+    pos = positions[0]
+    volume = min(req.volume, pos.volume)
+    if volume <= 0:
+        return OrderActionOut(success=False, error="Requested close volume is <= 0")
+
+    close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    filling = _pick_filling_mode(pos.symbol)
+    with MT5_LOCK:
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            return OrderActionOut(success=False, error=f"No tick for {pos.symbol}: {mt5.last_error()}")
+        price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": volume,
+            "type": close_type,
+            "position": pos.ticket,
+            "price": price,
+            "deviation": req.deviation,
+            "magic": pos.magic,
+            "comment": "Aureus AI partial TP",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling,
+        }
+        result = mt5.order_send(request)
+
+    if result is None:
+        return OrderActionOut(success=False, error=f"order_send returned None: {mt5.last_error()}")
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        log.warning("Partial close rejected: retcode=%s comment=%s", result.retcode, result.comment)
+        return OrderActionOut(success=False, error=f"retcode {result.retcode}: {result.comment}")
+
+    log.info("Position #%s partially closed: %s lots @ %s", req.ticket, volume, result.price)
+    return OrderActionOut(success=True, price=float(result.price))
+
+
+@app.post("/order/modify_sl", response_model=OrderActionOut, dependencies=[Depends(require_api_key)])
+def order_modify_sl(req: ModifySlIn):
+    """Automatic Break-Even (Aureus AI, 2026-09-20): moves an existing
+    position's Stop Loss (and optionally Take Profit) via TRADE_ACTION_SLTP
+    — no price/volume change, just the protective levels."""
+    ensure_connected()
+    with MT5_LOCK:
+        positions = mt5.positions_get(ticket=req.ticket) or ()
+    if not positions:
+        return OrderActionOut(success=False, error=f"Position #{req.ticket} not found (already closed?)")
+    pos = positions[0]
+
+    with MT5_LOCK:
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": pos.symbol,
+            "position": pos.ticket,
+            "sl": req.stop_loss,
+            "tp": req.take_profit if req.take_profit is not None else pos.tp,
+        }
+        result = mt5.order_send(request)
+
+    if result is None:
+        return OrderActionOut(success=False, error=f"order_send returned None: {mt5.last_error()}")
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        log.warning("SL modify rejected: retcode=%s comment=%s", result.retcode, result.comment)
+        return OrderActionOut(success=False, error=f"retcode {result.retcode}: {result.comment}")
+
+    log.info("Position #%s SL moved to %s", req.ticket, req.stop_loss)
+    return OrderActionOut(success=True)
 
 
 @app.get("/candles", response_model=List[CandleOut], dependencies=[Depends(require_api_key)])

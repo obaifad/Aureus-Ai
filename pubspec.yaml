@@ -22,8 +22,11 @@ dependencies:
   # uses Flutter's built-in services.dart — no extra package needed.
   share_plus: ^10.1.4
 
-  # Local push notifications for new trade signals
-  flutter_local_notifications: ^17.2.2
+  # Local push notifications for new trade signals. Bumped from ^17.2.2
+  # (2026-09-15, explicit request — Windows never showed/sounded a
+  # notification at all): Windows support didn't exist in this package
+  # before 19.3.0, so 17.x silently had nothing to initialize on desktop.
+  flutter_local_notifications: ^20.1.0
 
   # Keeps SignalChecker polling on a Timer while the app is backgrounded/
   # closed (Android/iOS) — see lib/services/monitor_task_handler.dart.

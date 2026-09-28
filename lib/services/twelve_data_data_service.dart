@@ -28,7 +28,16 @@ class TwelveDataDataService implements DataService {
   }
 
   @override
-  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300}) async {
+  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300, String? symbol}) async {
+    // Rejected rather than silently ignored (2026-09-18): this client only
+    // ever queries 'XAU/USD' below — serving a different [symbol]'s candles
+    // back under the caller's own label (e.g. DxyFilterService asking for
+    // DXY and silently getting gold) would be a much worse failure than a
+    // clean exception FailoverDataService already knows how to fall back
+    // from.
+    if (symbol != null) {
+      throw DataServiceException('TwelveDataDataService only serves XAU/USD — arbitrary symbols are not supported');
+    }
     final apiKey = AppConfig.twelveDataApiKey;
     if (apiKey.isEmpty) {
       throw DataServiceException('No TwelveData API key configured');

@@ -15,7 +15,24 @@ class PriceAlertService {
     // service isolate — reload so each side sees the other's writes.
     await prefs.reload();
     final raw = prefs.getStringList(_prefsKey) ?? const [];
-    return raw.map((s) => PriceAlert.fromJson(jsonDecode(s) as Map<String, dynamic>)).toList();
+
+    // Skip (and drop) any entry that fails to parse — e.g. a leftover
+    // record from an older schema (2026-09-15 fix: a single malformed
+    // alert used to throw out of the whole .map(), which crashed
+    // checkAndTrigger() on EVERY cycle and silently disabled price alerts
+    // entirely until the app was reinstalled). A cheap malformed record
+    // must never take the rest of the list down with it.
+    final parsed = <PriceAlert>[];
+    var droppedAny = false;
+    for (final s in raw) {
+      try {
+        parsed.add(PriceAlert.fromJson(jsonDecode(s) as Map<String, dynamic>));
+      } catch (_) {
+        droppedAny = true;
+      }
+    }
+    if (droppedAny) await _persist(parsed);
+    return parsed;
   }
 
   Future<void> addAlert({required double targetPrice, required bool triggerAbove}) async {

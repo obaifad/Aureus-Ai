@@ -18,10 +18,10 @@ class YahooFinanceDataService implements DataService {
   static const _yahooSymbol = 'GC=F';
 
   @override
-  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300}) async {
+  Future<List<Candle>> getCandles({required int timeframeMinutes, int count = 300, String? symbol}) async {
     final aggregateInto4h = timeframeMinutes == 240;
     final (interval, range) = _intervalAndRangeFor(timeframeMinutes);
-    final uri = Uri.parse('https://query1.finance.yahoo.com/v8/finance/chart/$_yahooSymbol')
+    final uri = Uri.parse('https://query1.finance.yahoo.com/v8/finance/chart/${symbol ?? _yahooSymbol}')
         .replace(queryParameters: {'interval': interval, 'range': range});
 
     final response = await http

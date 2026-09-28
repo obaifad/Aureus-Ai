@@ -86,17 +86,29 @@ enum TradeDirection { buy, sell }
 /// sweep (2026-09-11 — "فينا نعمل Watcher بالتطبيق؟"): [open] until the
 /// live price crosses either the Stop Loss or Take Profit, then locked to
 /// [win] or [loss] and never re-evaluated again.
-enum TradeOutcome { open, win, loss }
+enum TradeOutcome { open, win, loss, manualClose }
 
 /// The kind of structure a [SetupZone] was found at.
 ///
-/// `confluence`/`breakoutRetest`/`trendlineBounce`/`srBounce` are the
-/// original single-timeframe zone types (kept only so old persisted signal
-/// history — SharedPreferences JSON with these `setup_type` values — still
-/// deserializes; TaEngine no longer produces them). The Strict Top-Down
-/// Dual-Mode strategy (see TaEngine.buildHtfZones / findExecutionTrigger)
-/// produces `htfReversal`, `htfRetest`, or `momentumBreakout` on 1M/5M, and
-/// `absorption15m` (TaEngine.find15mAbsorptionTrigger, 2026-09-10) on 15M.
+/// `confluence`/`breakoutRetest`/`trendlineBounce`/`srBounce`/`htfReversal`/
+/// `absorption15m`/`momentumBreakout` are retired types (kept only so old
+/// persisted signal history — SharedPreferences JSON with these
+/// `setup_type` values — still deserializes; TaEngine no longer produces
+/// them). `htfReversal` — a fresh first-touch rejection at an unbroken
+/// zone — was retired 2026-09-18 with the HTF Retest Protocol, having
+/// already been rejected outright by SignalChecker since 2026-09-17.
+/// `absorption15m` — the standalone 15M Higher Low / Lower High Absorption
+/// strategy — was retired the same day (explicit request); its underlying
+/// pattern classifier (TaEngine.classifyStrongAbsorption) lives on as a
+/// shared confirmation check for the HTF Retest Protocol and
+/// ImpulseCorrectionEngine, just no longer as an independent path into a
+/// trade. `momentumBreakout` — the standalone "fire on a decisive
+/// expansion candle near any zone with no confirmed retest" fallback —
+/// was retired 2026-09-18 too (explicit request): TaEngine.classifyMomentum
+/// lives on as one of the HTF Retest Protocol's own confirmation checks,
+/// just no longer as an independent trigger path. The Strict Top-Down
+/// strategy (see TaEngine.buildHtfZones / findExecutionTrigger) now
+/// produces only `htfRetest`, on 15M.
 enum SetupType {
   confluence,
   breakoutRetest,
@@ -104,7 +116,9 @@ enum SetupType {
   srBounce,
   htfReversal,
   htfRetest,
+  /// Retired 2026-09-18 — kept only so old persisted history deserializes.
   momentumBreakout,
+  /// Retired 2026-09-18 — kept only so old persisted history deserializes.
   absorption15m,
   // ICT / Smart-Money-Concepts strategy (ict_engine.dart, 2026-09-12) — an
   // independent strategy layer, see AppConfig's "ICT" section for context.
@@ -118,6 +132,31 @@ enum SetupType {
   // entry at the end of a corrective pullback following a strong impulsive
   // leg. See AppConfig's "Impulse-Correction-Impulse" section.
   impulseCorrectionContinuation,
+  // Opening Range Breakout strategy (orb_engine.dart, 2026-09-18) — a
+  // fourth independent strategy layer, deliberately isolated from every
+  // other tier: a mechanical breakout of the first 30 minutes of the
+  // London or New York session, with no HTF zone, structure bias, or
+  // candlestick-pattern dependency at all. A retest of the broken boundary
+  // is mandatory before entry (the old immediate no-retest mode was
+  // removed). See AppConfig's "Opening Range Breakout" section.
+  orbBreakout,
+  // Breakout/Momentum strategy (breakout_momentum_engine.dart, 2026-09-18)
+  // — a fifth independent strategy layer: an M5 candle-close breakout of a
+  // structural level (previous session High/Low, a configurable Opening
+  // Range, Previous Day High/Low, or an HTF S/R zone), gated on an
+  // ATR(14)-normalized body AND a close-location wick filter — never a
+  // touch or wick-only penetration. See AppConfig's "Breakout/Momentum"
+  // section.
+  breakoutMomentum,
+  // Ranging Market Module — Zone Bounce Protocol (zone_bounce_engine.dart,
+  // 2026-09-25) — a sixth independent strategy layer, and the mirror image
+  // of htfRetest: a clean rejection off an HTF level that HOLDS, taken only
+  // while there is NO clear HTF bias. The Top-Down protocol cannot produce
+  // this setup by construction (it requires a decisive close THROUGH the
+  // level first, and rejects a Pinbar as confirmation), which is exactly
+  // why this is a separate tier rather than a loosening of that one. See
+  // AppConfig's "Ranging Market Module" section.
+  rangingBounce,
 }
 
 extension SetupTypeLabel on SetupType {
@@ -137,12 +176,15 @@ extension SetupTypeLabel on SetupType {
         SetupType.ictBreakerBlock => 'ICT Breaker / Mitigation Retest',
         SetupType.ictTrendlineContinuation => 'ICT Trendline Continuation',
         SetupType.impulseCorrectionContinuation => 'Impulse-Correction-Impulse Continuation',
+        SetupType.orbBreakout => 'Opening Range Breakout',
+        SetupType.breakoutMomentum => 'Breakout / Momentum',
+        SetupType.rangingBounce => 'Range Zone Bounce',
       };
 }
 
-/// Which of the 3 independent strategy engines produced a [SetupType] —
+/// Which of the six independent strategy engines produced a [SetupType] —
 /// used by trade_history_screen.dart's per-strategy analytics breakdown.
-enum StrategyFamily { topDown, ict, ici }
+enum StrategyFamily { topDown, ict, ici, orb, breakout, rangingBounce }
 
 extension SetupTypeStrategyFamily on SetupType {
   StrategyFamily get strategyFamily => switch (this) {
@@ -153,6 +195,9 @@ extension SetupTypeStrategyFamily on SetupType {
         SetupType.ictTrendlineContinuation =>
           StrategyFamily.ict,
         SetupType.impulseCorrectionContinuation => StrategyFamily.ici,
+        SetupType.orbBreakout => StrategyFamily.orb,
+        SetupType.breakoutMomentum => StrategyFamily.breakout,
+        SetupType.rangingBounce => StrategyFamily.rangingBounce,
         _ => StrategyFamily.topDown,
       };
 }
@@ -162,14 +207,17 @@ extension StrategyFamilyLabel on StrategyFamily {
         StrategyFamily.topDown => 'Top-Down',
         StrategyFamily.ict => 'ICT',
         StrategyFamily.ici => 'ICI',
+        StrategyFamily.orb => 'ORB',
+        StrategyFamily.breakout => 'Breakout',
+        StrategyFamily.rangingBounce => 'Range Bounce',
       };
 }
 
 /// A candidate entry zone RiskEngine prices a setup against. [trendline]
 /// and/or [srLevel] may be null — e.g. a Strict Top-Down trigger only
 /// carries a flattened [zonePrice] (see [HtfZone]), no raw trendline/S-R
-/// objects. [zonePrice] is always populated and is the single reference
-/// price RiskEngine anchors the Stop Loss to, regardless of source.
+/// objects. [zonePrice] is always populated and is the reference price
+/// RiskEngine anchors the Stop Loss to whenever [swingAnchor] is absent.
 class SetupZone {
   final SetupType type;
   final Trendline? trendline;
@@ -177,12 +225,28 @@ class SetupZone {
   final double zonePrice;
   final int candleIndex;
 
+  /// The swept swing extreme the Stop Loss must sit BEHIND (2026-09-18, HTF
+  /// Retest Protocol) — the price at which the liquidity grab that set up
+  /// this entry would be proven wrong. When present it replaces [zonePrice]
+  /// as the structural anchor entirely: a stop at the zone boundary sits
+  /// inside the sweep that just happened and gets taken out by it.
+  final double? swingAnchor;
+
+  /// The next untapped liquidity / HTF level in the trade's favour
+  /// (2026-09-18) — RiskEngine prices Take Profit AT this level instead of
+  /// a blind [AppConfig.riskRewardRatio] multiple, since that is where
+  /// price is actually expected to react. Null when no such level exists
+  /// ahead of Entry, in which case the fixed ratio is used.
+  final double? liquidityTarget;
+
   const SetupZone({
     required this.type,
     this.trendline,
     this.srLevel,
     required this.zonePrice,
     required this.candleIndex,
+    this.swingAnchor,
+    this.liquidityTarget,
   });
 }
 
@@ -197,22 +261,30 @@ class HtfZone {
   const HtfZone({required this.price, required this.source});
 }
 
-/// A valid 1M/5M/15M price-action trigger — either at a pre-identified
-/// [HtfZone] (Reversal/Retest, or 15M Higher Low / Lower High Absorption)
-/// or from the breakout candle's own wick (Momentum) — the only thing that
-/// can produce a TradeSetup under the Strict Top-Down Dual-Mode strategy.
-/// [type] is [SetupType.htfReversal], [SetupType.htfRetest],
-/// [SetupType.momentumBreakout], or [SetupType.absorption15m].
+/// A valid 15M price-action trigger at a pre-identified [HtfZone], confirmed
+/// by the HTF Retest Protocol — the only thing that can produce a
+/// TradeSetup under the Strict Top-Down strategy. [type] is always
+/// [SetupType.htfRetest] (the standalone Momentum/Breakout fallback path
+/// was removed 2026-09-18).
 class ExecutionTrigger {
   final SetupType type;
   final HtfZone zone;
   final CandlePattern pattern;
   final int candleIndex;
 
+  /// Carried through to [SetupZone.swingAnchor] / [SetupZone.liquidityTarget]
+  /// — only the HTF Retest Protocol populates these; every other path
+  /// leaves them null and keeps RiskEngine's zone-anchored Stop Loss and
+  /// fixed-ratio Take Profit.
+  final double? swingAnchor;
+  final double? liquidityTarget;
+
   const ExecutionTrigger({
     required this.type,
     required this.zone,
     required this.pattern,
     required this.candleIndex,
+    this.swingAnchor,
+    this.liquidityTarget,
   });
 }

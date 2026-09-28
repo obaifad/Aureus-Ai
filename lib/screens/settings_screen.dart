@@ -14,6 +14,10 @@ class SettingsScreen extends StatelessWidget {
 
   String _pollLabel(Duration d) => d.inSeconds < 60 ? '${d.inSeconds} s' : '${d.inMinutes} min';
 
+  String _hhmm(int minutesSinceMidnightUtc) =>
+      '${(minutesSinceMidnightUtc ~/ 60).toString().padLeft(2, '0')}:'
+      '${(minutesSinceMidnightUtc % 60).toString().padLeft(2, '0')}';
+
   @override
   Widget build(BuildContext context) {
     final monitor = context.watch<SignalMonitor>();
@@ -63,10 +67,111 @@ class SettingsScreen extends StatelessWidget {
           _infoTile('Symbol', AppConfig.symbol),
           _infoTile('Timeframes', '4H / 1H context · 15M execution (closed candles)'),
           _infoTile('Min Confluence Score', '${AppConfig.minConfluenceScore}/100'),
-          _infoTile('Risk : Reward', '1 : ${AppConfig.riskRewardRatio.toStringAsFixed(0)}'),
+          _infoTile('Risk : Reward', '1 : ${AppConfig.riskRewardRatio.toStringAsFixed(1)}'),
           _infoTile('Min SL / TP', '${AppConfig.minStopLossPips.toStringAsFixed(0)} / '
               '${AppConfig.minTakeProfitPips.toStringAsFixed(0)} pips'),
           _infoTile('Poll interval', _pollLabel(AppConfig.pollInterval)),
+          const SizedBox(height: 16),
+          _sectionTitle(context, 'Engines'),
+          _infoTile(
+            'Trading mode',
+            AppConfig.enableAutoTrading
+                ? 'Auto-trading ON (orders are sent to MT5)'
+                : 'Monitor only (signals, no orders)',
+          ),
+          _infoTile(
+            'One Active Trade Limit',
+            AppConfig.oneActiveTradeLimit ? 'On (no new signal while a trade is open)' : 'Off (positions may overlap)',
+          ),
+          _infoTile('HTF Retest (Top-Down)', 'Always on'),
+          _infoTile('ICT', 'Always on'),
+          _infoTile('ICI', 'Always on'),
+          _infoTile('ORB', AppConfig.useOrb ? 'Enabled' : 'Disabled'),
+          _infoTile('Breakout / Momentum', AppConfig.useBreakoutMomentum ? 'Enabled' : 'Disabled'),
+          _infoTile('Range Bounce', AppConfig.enableRangingBounceMode ? 'Enabled' : 'Disabled'),
+          const SizedBox(height: 16),
+          _sectionTitle(context, 'Opening Range Breakout'),
+          _infoTile('ORB strategy', AppConfig.useOrb ? 'Enabled' : 'Disabled'),
+          if (AppConfig.useOrb) ...[
+            _infoTile(
+              'Sessions',
+              [
+                if (AppConfig.orbLondonEnabled) 'London',
+                if (AppConfig.orbNewYorkEnabled) 'New York',
+              ].join(', '),
+            ),
+            _infoTile('Retest mode', 'Required'),
+            _infoTile(
+              'Stop Loss',
+              AppConfig.orbStopLossPipsOverride > 0
+                  ? '${AppConfig.orbStopLossPipsOverride.toStringAsFixed(0)} pips (fixed)'
+                  : 'Dynamic (opposite range side)',
+            ),
+            _infoTile(
+              'Take Profit',
+              AppConfig.orbTakeProfitPipsOverride > 0
+                  ? '${AppConfig.orbTakeProfitPipsOverride.toStringAsFixed(0)} pips (fixed)'
+                  : '1 : ${AppConfig.riskRewardRatio.toStringAsFixed(1)} (standard R:R)',
+            ),
+          ],
+          const SizedBox(height: 16),
+          _sectionTitle(context, 'Breakout / Momentum'),
+          _infoTile('Breakout strategy', AppConfig.useBreakoutMomentum ? 'Enabled' : 'Disabled'),
+          if (AppConfig.useBreakoutMomentum) ...[
+            _infoTile('Level sources', 'Previous Session, Opening Range, PDH/PDL, HTF S/R'),
+            _infoTile(
+              'Opening Range window',
+              '${_hhmm(AppConfig.breakoutOpeningRangeStartUtcMinutes)}–'
+                  '${_hhmm(AppConfig.breakoutOpeningRangeEndUtcMinutes)} UTC',
+            ),
+            _infoTile(
+              'Body/ATR(14) band',
+              '${AppConfig.breakoutMinBodyToAtrRatio.toStringAsFixed(1)}x – '
+                  '${AppConfig.breakoutMaxBodyToAtrRatio.toStringAsFixed(1)}x',
+            ),
+            _infoTile(
+              'Close-location filter',
+              'Top/bottom ${((1 - AppConfig.breakoutCloseLocationThreshold) * 100).round()}%',
+            ),
+          ],
+          const SizedBox(height: 16),
+          _sectionTitle(context, 'Range Bounce'),
+          _infoTile('Range Bounce strategy', AppConfig.enableRangingBounceMode ? 'Enabled' : 'Disabled'),
+          if (AppConfig.enableRangingBounceMode) ...[
+            _infoTile('Active when', 'No clear HTF bias (1H undefined or 1H/4H disagree)'),
+            _infoTile('DXY filter', 'Exempt (not applied to this engine)'),
+            _infoTile('Touch Proximity', '\$${AppConfig.zoneBounceTouchDollars.toStringAsFixed(2)} from the level'),
+            _infoTile(
+              'Min Wick Ratio',
+              '${(AppConfig.zoneBounceMinWickRatio * 100).round()}% of candle range',
+            ),
+            _infoTile('Break Lookback Candles', '${AppConfig.zoneBounceBreakLookback} candles'),
+            _infoTile(
+              'Stop Loss ATR Margin',
+              '${AppConfig.zoneBounceSlAtrMultiplier.toStringAsFixed(2)}x ATR(14) beyond the wick',
+            ),
+            _infoTile(
+              'Min Boundary R:R',
+              'Clip TP at range boundary only if ≥ ${AppConfig.zoneBounceMinBoundaryR.toStringAsFixed(1)}R away '
+                  '(else 1 : ${AppConfig.riskRewardRatio.toStringAsFixed(1)})',
+            ),
+            _infoTile('Evaluated Zones Count', '${AppConfig.zoneBounceEvaluatedZoneCount} nearest zones'),
+          ],
+          const SizedBox(height: 16),
+          _sectionTitle(context, 'DXY Correlation Filter'),
+          _infoTile('Filter', AppConfig.useDxyFilter ? 'Enabled' : 'Disabled'),
+          if (AppConfig.useDxyFilter) ...[
+            _infoTile(
+              'DXY symbol',
+              AppConfig.dxySymbolName.isEmpty ? 'Auto-detect' : AppConfig.dxySymbolName,
+            ),
+            _infoTile(
+              'Applies to',
+              'HTF Retest, ICT, ICI, ORB (hard block); '
+                  'Breakout via BREAKOUT_DXY_MODE=${AppConfig.breakoutDxyMode}',
+            ),
+            _infoTile('Exempt', 'Range Bounce (judged on range structure, not dollar bias)'),
+          ],
           const SizedBox(height: 16),
           _sectionTitle(context, 'AI & Alerts'),
           _infoTile('Anthropic (app fallback)', AppConfig.anthropicApiKey.isEmpty ? 'Not set' : 'Configured ✓'),

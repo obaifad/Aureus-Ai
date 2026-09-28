@@ -340,7 +340,7 @@ class _ChartPainter extends CustomPainter {
     var lo = shown.map((c) => c.low).reduce(math.min);
     // Keep open-trade levels that are near the visible range on screen.
     for (final t in openTrades) {
-      for (final level in [t.entry, t.stopLoss, t.takeProfit]) {
+      for (final level in [t.effectiveEntry, t.activeStopLoss, t.takeProfit]) {
         if (level < hi + (hi - lo) && level > lo - (hi - lo)) {
           hi = math.max(hi, level);
           lo = math.min(lo, level);
@@ -381,11 +381,11 @@ class _ChartPainter extends CustomPainter {
     // Open trades: Entry / SL / TP.
     for (final t in openTrades) {
       final startX = _xForTime(t.detectedAt, startIndex, endIndex, xOf, candleW) ?? 0;
-      _levelLine(canvas, startX, chartW, y(t.entry), Colors.white70, dashed: true);
-      _levelLine(canvas, startX, chartW, y(t.stopLoss), _bear);
+      _levelLine(canvas, startX, chartW, y(t.effectiveEntry), Colors.white70, dashed: true);
+      _levelLine(canvas, startX, chartW, y(t.activeStopLoss), _bear);
       _levelLine(canvas, startX, chartW, y(t.takeProfit), _bull);
-      _text(canvas, '${t.directionLabel} ${t.timeframeLabel}', Offset(math.min(startX + 4, chartW - 70), y(t.entry) - 14),
-          Colors.white70, 10);
+      _text(canvas, '${t.directionLabel} ${t.timeframeLabel}',
+          Offset(math.min(startX + 4, chartW - 70), y(t.effectiveEntry) - 14), Colors.white70, 10);
     }
 
     // Live price line (bid, when bridge ticks are applied).
@@ -413,7 +413,7 @@ class _ChartPainter extends CustomPainter {
     }
     _priceTag(canvas, chartW, y(live), live, const Color(0xFFD4AF37));
     for (final t in openTrades) {
-      _priceTag(canvas, chartW, y(t.stopLoss), t.stopLoss, _bear);
+      _priceTag(canvas, chartW, y(t.activeStopLoss), t.activeStopLoss, _bear);
       _priceTag(canvas, chartW, y(t.takeProfit), t.takeProfit, _bull);
     }
 

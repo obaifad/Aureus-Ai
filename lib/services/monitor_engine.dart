@@ -143,6 +143,13 @@ class MonitorEngine {
   }
 
   Future<void> _onTick(Tick tick) async {
+    // Live Pip Counter (2026-09-21, explicit request): pushed on every tick,
+    // independent of whether anything is actually open — cheap (bid/ask are
+    // already in hand from the SL/TP fast path below), and lets the UI show
+    // a genuinely live-moving number rather than one that only refreshes on
+    // the ~30s scan cycle.
+    onEvent({'type': 'tick', 'bid': tick.bid, 'ask': tick.ask});
+
     if (_open.isEmpty) return;
     final crossed = _open.any((s) => s.evaluateOutcomeAtTick(bid: tick.bid, ask: tick.ask) != null);
     if (!crossed) return;

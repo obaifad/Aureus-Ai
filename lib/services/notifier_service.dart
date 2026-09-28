@@ -18,14 +18,30 @@ class NotifierService {
   static final FlutterLocalNotificationsPlugin _plugin = FlutterLocalNotificationsPlugin();
   static bool _initialized = false;
 
+  /// Windows never showed (or sounded) a notification at all before
+  /// 2026-09-15 — this package's Windows platform support didn't exist
+  /// until v19.3.0 (this project was pinned to ^17.2.2), so on desktop
+  /// [_plugin.initialize] had nothing to actually initialize. The GUID is
+  /// this app's own fixed identity (arbitrary but stable — generated once,
+  /// never changes) that Windows uses to register the Toast notification
+  /// source; unlike [iconPath] (native code reads it directly off disk, not
+  /// through Flutter's asset bundle, so a build-time-relative path would
+  /// break once the app is installed/copied elsewhere) it's left unset —
+  /// Windows just shows the app's own default icon instead.
+  static const _windows = WindowsInitializationSettings(
+    appName: 'Aureus AI',
+    appUserModelId: 'Com.AureusAI.TradingAssistant',
+    guid: '561cb069-356a-4009-8a31-fc467a96298d',
+  );
+
   Future<void> _ensureInitialized() async {
     if (_initialized) return;
     _initialized = true;
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const ios = DarwinInitializationSettings();
-    const settings = InitializationSettings(android: android, iOS: ios);
+    const settings = InitializationSettings(android: android, iOS: ios, windows: _windows);
     try {
-      await _plugin.initialize(settings);
+      await _plugin.initialize(settings: settings);
     } catch (e) {
       AppLogger.log('NotifierService: local notification init failed: $e');
     }
@@ -40,9 +56,13 @@ class NotifierService {
       importance: Importance.high,
       priority: Priority.high,
     );
-    const details = NotificationDetails(android: androidDetails, iOS: DarwinNotificationDetails());
+    const details = NotificationDetails(
+      android: androidDetails,
+      iOS: DarwinNotificationDetails(),
+      windows: WindowsNotificationDetails(),
+    );
     try {
-      await _plugin.show(id, title, body, details);
+      await _plugin.show(id: id, title: title, body: body, notificationDetails: details);
     } catch (e) {
       AppLogger.log('NotifierService: show() failed: $e');
     }

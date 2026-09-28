@@ -1,18 +1,21 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 
+import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/app_config.dart';
+import '../models/pivot.dart' show TradeDirection;
 import '../models/trade_setup.dart';
 import 'app_logger.dart';
 import 'connection_status_service.dart';
 import 'history_store.dart';
 import 'monitor_engine.dart';
 import 'monitor_task_handler.dart';
+import 'signal_checker.dart';
 
 /// Persists whether monitoring was intentionally ON, so it auto-resumes on a
 /// fresh app process without tapping Start again.
@@ -42,6 +45,14 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
   double? _livePrice;
   bool? _tickConnected;
 
+  /// Live Pip Counter (2026-09-21): the latest bid/ask straight off the
+  /// tick stream — updates far more often than [livePrice] (which only
+  /// refreshes once per ~30s scan cycle), so an open trade's floating
+  /// pips can move in real time. Null until the first tick arrives (mock
+  /// mode, standalone/no-bridge mode, or before the stream connects).
+  double? _liveBid;
+  double? _liveAsk;
+
   List<TradeSetup> _history = const [];
 
   bool get isRunning => _isRunning;
@@ -51,6 +62,8 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
   DateTime? get lastSuccessfulCheck => _lastSuccessfulCheck;
   FeedSource? get feed => _feed;
   double? get livePrice => _livePrice;
+  double? get liveBid => _liveBid;
+  double? get liveAsk => _liveAsk;
 
   /// null = no tick stream (mock mode / not started yet).
   bool? get tickConnected => _tickConnected;
@@ -227,6 +240,10 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
       case 'tickConn':
         _tickConnected = event['connected'] == true;
         _notify();
+      case 'tick':
+        _liveBid = (event['bid'] as num?)?.toDouble() ?? _liveBid;
+        _liveAsk = (event['ask'] as num?)?.toDouble() ?? _liveAsk;
+        _notify();
     }
   }
 
@@ -268,6 +285,33 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> _reloadHistory() async {
     _history = await HistoryStore.load();
     _notify();
+  }
+
+  /// Manual Close (2026-09-17, price source fixed 2026-09-21) — UI entry
+  /// point for the "Close Trade" button: closes [tradeId] via SignalChecker.
+  /// closeTradeManually, then reloads history so the button disappears and
+  /// the outcome ribbon updates immediately.
+  ///
+  /// Prices off the fresh tick stream ([liveBid]/[liveAsk] — same
+  /// direction-aware convention as everywhere else: a BUY closes on the
+  /// bid, a SELL on the ask), NOT [livePrice] (which only refreshes once
+  /// per ~30s scan cycle). Using the stale [livePrice] here was a real bug
+  /// (found live, 2026-09-21): the Live Pip Counter on the card (fed by
+  /// ticks, updating multiple times a second) could show one number while
+  /// the button — reading a price up to ~30s old — actually closed the
+  /// trade at a materially different one, exactly the "±20 pip surprise
+  /// vs. what the counter showed" the user reported. Falls back to
+  /// [livePrice] only when no tick has arrived yet (mock mode, standalone/
+  /// no-bridge mode).
+  Future<void> closeTradeManually(String tradeId) async {
+    final setup = _history.where((s) => s.uid == tradeId).firstOrNull;
+    final tickPrice = setup == null
+        ? null
+        : (setup.direction == TradeDirection.buy ? _liveBid : _liveAsk);
+    final price = tickPrice ?? _livePrice;
+    if (price == null) return;
+    await SignalChecker().closeTradeManually(tradeId, price);
+    await _reloadHistory();
   }
 
   @override

@@ -156,9 +156,11 @@ class TaEngine {
   /// BOTH a decisive, wide-bodied candle (body dominates its own range —
   /// the opposite of a Pinbar/Doji) AND meaningfully larger than the
   /// recent average range (a genuine expansion, not just an ordinary bar
-  /// that happens to close near its high/low). Used by findExecutionTrigger
-  /// as the second (Momentum/Breakout) trigger path, independent of
-  /// classifyPattern's Reversal/Retest path above.
+  /// that happens to close near its high/low). No longer an independent
+  /// trigger path on its own (that standalone fallback was removed from
+  /// findExecutionTrigger 2026-09-18) — now used only as one of
+  /// [_decisiveConfirmation]'s confirmation standards inside the HTF Retest
+  /// Protocol, plus by ImpulseCorrectionEngine and IctEngine.
   CandlePattern classifyMomentum(List<Candle> candles, int index, {int lookback = 20}) {
     if (index < 0 || index >= candles.length) return CandlePattern.none;
     final c = candles[index];
@@ -181,17 +183,18 @@ class TaEngine {
   }
 
   // ---------------------------------------------------------------------
-  // 5) STRICT TOP-DOWN STRATEGY (DUAL-MODE SIGNAL ENGINE)
+  // 5) STRICT TOP-DOWN STRATEGY (HTF RETEST PROTOCOL)
   //    a) buildHtfZones — structural S/R + trendlines from 15M/1H/4H ONLY
   //       (2026-09-10: 4H added). 1M/5M are never used to seed a new zone.
   //    b) findExecutionTrigger — the ONLY thing that can produce a setup:
-  //       a 1M/5M price-action trigger — Reversal/Retest at one of those
-  //       pre-identified HTF zones, OR a Momentum/Breakout expansion
-  //       candle when no Reversal/Retest pattern exists. 5M is the primary
-  //       execution timeframe; 1M is a same-cycle scalping fallback only
-  //       tried when 5M finds nothing (see signal_checker.dart) — this
-  //       method itself is fully timeframe-agnostic, operating on whatever
-  //       candle list it's given.
+  //       the HTF Retest Protocol at one of those pre-identified HTF zones
+  //       (see 5b below). 15M is the only execution timeframe (2026-09-14)
+  //       — this method itself is fully timeframe-agnostic, operating on
+  //       whatever candle list it's given. (15M Higher Low / Lower High
+  //       Absorption was a third, independent path here, retired
+  //       2026-09-18 — see section 6 below; the standalone Momentum/
+  //       Breakout fallback path was removed the same day, explicit
+  //       request — no entry without a confirmed retest anymore.)
   // ---------------------------------------------------------------------
 
   /// Builds the pool of structural "Key Zones" a Strict Top-Down strategy
@@ -266,148 +269,322 @@ class TaEngine {
     return nearest;
   }
 
+  /// The [count] zones genuinely NEAREST to [price], closest first, ranked
+  /// by TRUE distance with NO timeframe handicap (2026-09-25, Multi-Zone
+  /// Evaluation fix).
+  ///
+  /// [findNearestZone] above returns exactly one zone and subtracts a
+  /// handicap from higher-timeframe zones when ranking, so a genuinely
+  /// closer level can lose and then never be evaluated at all. Observed
+  /// live on 2026-09-25: a 15M Support $1.66 from price lost to a 1H
+  /// Support $2.33 away (2.33 - 1.00 < 1.66), so the only level the engine
+  /// examined that cycle was not the one price was actually reacting at.
+  ///
+  /// That handicap is correct for its own caller — the Top-Down protocol
+  /// trades ONE zone and should prefer the bigger structure in a near-tie —
+  /// so it is left exactly as it is here. This is an additional entry point
+  /// for callers that evaluate SEVERAL zones and therefore have no tie to
+  /// break: whichever zone actually produces a valid setup wins, which is a
+  /// better answer than guessing beforehand. Duplicate prices are kept; two
+  /// timeframes independently finding the same level is confluence, and the
+  /// caller's own scoring is where that belongs.
+  List<HtfZone> findNearestZones(List<HtfZone> zones, double price, {int count = 3}) {
+    if (count <= 0) return const [];
+    final sorted = [...zones]..sort(
+        (a, b) => (price - a.price).abs().compareTo((price - b.price).abs()),
+      );
+    return sorted.take(count).toList();
+  }
+
   /// The ONLY entry point into a trade under the Strict Top-Down strategy:
-  /// finds the nearest of [htfZones] to the current price, then tries TWO
-  /// independent trigger paths there, in order —
-  ///  a) Reversal/Retest (preferred): a Pinbar/Engulfing candle at the
-  ///     zone, confirmed EITHER by genuine Institutional Absorption
-  ///     (2026-09-10 High-Probability Gating) — the WICK breaks the zone's
-  ///     exact price boundary while the BODY closes strictly back behind
-  ///     it, see [_isInstitutionalAbsorption] — OR, when [nearest] is a
-  ///     Confluence Zone (2026-09-11, see [_isConfluenceZone]: corroborated
-  ///     by another independent zone very close to it, e.g. a Trendline
-  ///     crossing a Support/Resistance), simply by price sitting within the
-  ///     Interest Area — no wick penetration required there, since two+
-  ///     independent structural findings agreeing is already strong enough
-  ///     confirmation on its own. An ordinary single-source zone still
-  ///     requires the full Institutional Absorption check.
-  ///  b) Momentum/Breakout (fallback, only tried when (a) finds nothing): a
-  ///     decisive, wide-bodied expansion candle in a clear direction (see
-  ///     [classifyMomentum]) — no Pinbar/Engulfing required. Eligible when
-  ///     price sits within AppConfig.interestZoneBufferDollars of [nearest]
-  ///     — a flexible "Interest Area" (2026-09-09) — OR when this candle's
-  ///     own high-low range crossed the zone price intrabar (Order Flow
-  ///     allowance, 2026-09-09): a Momentum candle that spiked through the
-  ///     level and closed meaningfully beyond the buffer is still a
-  ///     genuine Order Flow confirmation. Its SL is anchored to the
-  ///     breakout candle's OWN opposing wick rather than [nearest], since a
-  ///     distant structural zone would blow up what should be a tight
-  ///     momentum stop.
-  /// Returns null when neither path finds a qualifying trigger, or when
+  /// finds the nearest of [htfZones] to the current price, then requires
+  /// the full HTF Retest Protocol (see [_tryHtfRetestProtocol]) to confirm
+  /// there — a real liquidity sweep + structure shift + retest sequence.
+  /// Skipped entirely when the caller has no clear [htfBias], since the
+  /// whole path is defined as a with-trend continuation.
+  ///
+  /// The Momentum/Breakout fallback path (fire immediately on a decisive
+  /// expansion candle near any zone when no retest was confirmed) was
+  /// removed 2026-09-18, explicit request — it let a wide-bodied candle
+  /// alone justify a Top-Down entry with no retest at all, which is looser
+  /// than the strategy's own "confirmed retest" premise. [classifyMomentum]
+  /// stays in use elsewhere (as one of [_decisiveConfirmation]'s own
+  /// confirmation standards *inside* the retest protocol, and in
+  /// ImpulseCorrectionEngine/IctEngine) — only this standalone fallback
+  /// trigger is gone. [SetupType.momentumBreakout] is kept only so old
+  /// persisted signal history still deserializes.
+  ///
+  /// Returns null when the retest protocol finds nothing, or when
   /// [htfZones]/[candles] are empty. [candles] is used *only* for these
-  /// pattern checks — never to derive a new structural zone of their own —
-  /// and this method is fully timeframe-agnostic: the caller passes
-  /// whichever of 1M or 5M it wants checked (see signal_checker.dart, which
-  /// tries 5M first and falls back to 1M scalping only when 5M finds
-  /// nothing).
+  /// pattern/structure checks — never to derive a new structural zone of
+  /// its own — and this method is fully timeframe-agnostic (SignalChecker
+  /// passes 15M, the only execution timeframe since 2026-09-14).
   ExecutionTrigger? findExecutionTrigger({
     required List<Candle> candles,
     required List<HtfZone> htfZones,
+    TradeDirection? htfBias,
     int lookback = 15,
   }) {
-    if (candles.isEmpty || htfZones.isEmpty) return null;
+    if (candles.isEmpty || htfZones.isEmpty || htfBias == null) return null;
     final lastIndex = candles.length - 1;
-    final lastCandle = candles[lastIndex];
-    final lastPrice = lastCandle.close;
+    final lastPrice = candles[lastIndex].close;
 
     final nearest = findNearestZone(htfZones, lastPrice);
     if (nearest == null) return null;
-    final nearestDist = (lastPrice - nearest.price).abs();
 
-    // Path A — Reversal/Retest: both trigger types require the SAME
-    // confirming candle at the zone — a bare touch with no pattern is
-    // never a trigger of either kind. What distinguishes Reversal from
-    // Retest is the recent price history.
-    final pattern = classifyPattern(candles, lastIndex);
-    final isBullishPattern = pattern == CandlePattern.bullishPinbar || pattern == CandlePattern.bullishEngulfing;
-    final isBearishPattern = pattern == CandlePattern.bearishPinbar || pattern == CandlePattern.bearishEngulfing;
+    return _tryHtfRetestProtocol(
+      candles: candles,
+      htfZones: htfZones,
+      nearest: nearest,
+      htfBias: htfBias,
+      lookback: lookback,
+    );
+  }
 
-    if (isBullishPattern || isBearishPattern) {
-      final sweepConfirmed = _isInstitutionalAbsorption(lastCandle, nearest.price, isBullish: isBullishPattern);
+  // ---------------------------------------------------------------------
+  // 5b) HTF RETEST PROTOCOL (2026-09-18)
+  // ---------------------------------------------------------------------
 
-      // Confluence Zone relaxation (2026-09-11 — "ليش لما يدق بالدعم او
-      // المقاومة والتريند لاين ماعم تعطينا صفقات"): when [nearest] is
-      // corroborated by at least one OTHER independent zone very close to
-      // it (e.g. a Trendline overlapping a Support/Resistance, or 1H and
-      // 4H agreeing) — see [_isConfluenceZone] — that's a materially
-      // stronger level than any single-source zone, so a plain confirmed
-      // Pinbar/Engulfing within the Interest Area is enough here; it does
-      // NOT need the wick to also literally break the zone's exact price
-      // the way a single-source zone still does. Ordinary, non-confluence
-      // zones are completely unaffected — same strict sweepConfirmed-only
-      // gate as before.
-      final withinBuffer =
-          nearestDist <= AppConfig.interestZoneBufferDollars + AppConfig.interestZoneToleranceDollars;
-      final confluenceConfirmed = withinBuffer && _isConfluenceZone(nearest, htfZones);
+  /// The strict, textbook Smart-Money retest sequence that replaced the old
+  /// "a Pinbar/Engulfing at a zone price happened to have closed far from
+  /// recently" Reversal/Retest path. Every gate below must pass, IN ORDER;
+  /// failing any one produces no trigger at all. [SetupType.htfReversal] —
+  /// the old fresh-first-touch variant — is gone with it, having already
+  /// been rejected outright by SignalChecker since 2026-09-17.
+  ///
+  ///  1. HTF Zone — [nearest], the strongest structural level to price.
+  ///  2. HTF Trend/Bias — [htfBias], a strict 1H+4H swing-structure
+  ///     consensus computed by the caller. The trade only ever goes WITH
+  ///     it, so this path can no longer fire countertrend the way the old
+  ///     one could through SignalChecker's Break & Retest exemption.
+  ///  3. Price broke DECISIVELY through the zone in the bias direction and
+  ///     then came back INTO it — a genuine Break & Retest, in that order,
+  ///     rather than a first touch or a signal fired from far away.
+  ///  4. Liquidity Sweep — resting liquidity was actually taken first,
+  ///     either at a recent swing ([findLiquiditySweep], the stronger
+  ///     reading) or at the zone itself ([_isInstitutionalAbsorption]).
+  ///     Whichever extreme it reached becomes the Stop Loss anchor.
+  ///  5. Market Structure Shift — the last candle closes beyond the swing
+  ///     that framed the move into that sweep ([_findStructureShift]).
+  ///     This is the step that separates an entry from a stop hunt still
+  ///     in progress.
+  ///  6. The MSS candle itself must be decisive ([_decisiveConfirmation]):
+  ///     displacement, Engulfing or strong Absorption. A Pinbar or Doji
+  ///     poking marginally past the level is not a structure shift.
+  ///
+  /// The returned trigger carries [ExecutionTrigger.swingAnchor] (the swept
+  /// extreme — RiskEngine puts the Stop Loss behind THAT, not behind the
+  /// zone boundary, which sits inside the sweep that just happened) and
+  /// [ExecutionTrigger.liquidityTarget] (the next untapped swing/HTF level
+  /// in the trade's favour, which RiskEngine prices Take Profit at instead
+  /// of a blind fixed multiple).
+  ExecutionTrigger? _tryHtfRetestProtocol({
+    required List<Candle> candles,
+    required List<HtfZone> htfZones,
+    required HtfZone nearest,
+    required TradeDirection htfBias,
+    required int lookback,
+  }) {
+    final lastIndex = candles.length - 1;
+    final last = candles[lastIndex];
+    final bullish = htfBias == TradeDirection.buy;
+    final windowStart = (lastIndex - lookback).clamp(0, lastIndex);
 
-      if (sweepConfirmed || confluenceConfirmed) {
-        // Did price already close decisively through this exact zone within
-        // the recent lookback window (before this candle)? If so, this
-        // confirming candle is validating a retest of broken structure —
-        // otherwise it's a fresh rejection the first time price reached it.
-        final start = (lastIndex - lookback).clamp(0, lastIndex);
-        final brokeRecently = _rangeHasClose(
-          candles,
-          start,
-          lastIndex,
-          (c) => (c.close - nearest.price).abs() > AppConfig.proximityThreshold,
-        );
-
-        final confirmationLabel =
-            sweepConfirmed ? 'Liquidity Sweep — Institutional Absorption Confirmed' : 'Confluence Zone Confirmed';
-
-        return ExecutionTrigger(
-          type: brokeRecently ? SetupType.htfRetest : SetupType.htfReversal,
-          zone: HtfZone(
-            price: nearest.price,
-            source: '${nearest.source} ($confirmationLabel)',
-          ),
-          pattern: pattern,
-          candleIndex: lastIndex,
-        );
+    // Gate 3a — a close a full zone width beyond the level (see
+    // AppConfig.interestZoneBufferDollars): a candle closing on the zone's
+    // own far edge is still inside it, not through it.
+    int? breakIndex;
+    for (int i = windowStart; i < lastIndex; i++) {
+      final close = candles[i].close;
+      final through = bullish
+          ? close > nearest.price + AppConfig.interestZoneBufferDollars
+          : close < nearest.price - AppConfig.interestZoneBufferDollars;
+      if (through) {
+        breakIndex = i;
+        break;
       }
     }
+    if (breakIndex == null) return null;
 
-    // Path B — Momentum/Breakout: no confirmed Reversal/Retest sweep, but
-    // this candle may still show strong directional expansion on its own.
-    // interestZoneToleranceDollars (2026-09-10 — "ليش اذا كانت فوق المجال
-    // بـ10 بيب تلغي الصفقة؟"): a small extra flex margin on top of the main
-    // buffer so a near-miss doesn't hard-reject an otherwise valid trigger.
-    final withinInterestZone =
-        nearestDist <= AppConfig.interestZoneBufferDollars + AppConfig.interestZoneToleranceDollars;
-    final crossedZoneIntrabar = lastCandle.low <= nearest.price && lastCandle.high >= nearest.price;
-    if (!withinInterestZone && !crossedZoneIntrabar) return null;
-
-    // True only when eligibility came SOLELY from the penetration
-    // allowance above (not the normal in-buffer touch) — used below to
-    // visibly flag these as high-signal Order Flow confirmations wherever
-    // zone.source is already displayed (logs, notifications, Telegram, the
-    // zone-cooldown key), with no changes needed in any of those consumers.
-    final orderFlowPenetration = !withinInterestZone && crossedZoneIntrabar;
-
-    // The zone here is deliberately NOT [nearest] — a momentum entry's stop
-    // belongs just beyond the breakout candle's own opposing wick, not at
-    // a possibly-distant structural level (RiskEngine anchors SL to
-    // zone.zonePrice, so a far zone would blow up the SL/TP distance).
-    // [nearest] is preserved only as informational context in the label.
-    final momentum = classifyMomentum(candles, lastIndex);
-    if (momentum == CandlePattern.bullishMomentum || momentum == CandlePattern.bearishMomentum) {
-      final isBullish = momentum == CandlePattern.bullishMomentum;
-      final momentumZone = HtfZone(
-        price: isBullish ? lastCandle.low : lastCandle.high,
-        source: orderFlowPenetration
-            ? 'Momentum Breakout (nearest structure: ${nearest.source} — Liquidity Sweep — Order Flow Confirmed)'
-            : 'Momentum Breakout (nearest structure: ${nearest.source})',
-      );
-      return ExecutionTrigger(
-        type: SetupType.momentumBreakout,
-        zone: momentumZone,
-        pattern: momentum,
-        candleIndex: lastIndex,
-      );
+    // Gate 3b — and price came back to the zone AFTER that break.
+    var retested = false;
+    for (int i = breakIndex + 1; i <= lastIndex; i++) {
+      if (candles[i].low <= nearest.price && candles[i].high >= nearest.price) {
+        retested = true;
+        break;
+      }
     }
+    if (!retested) return null;
 
+    // Gate 4 — both sweep readings are collected rather than short-
+    // circuiting on the first: when both fired, the Stop Loss belongs
+    // behind whichever ran further.
+    final swingSweep = findLiquiditySweep(candles, bullish: bullish, minSweepIndex: breakIndex);
+    final zoneSweep = _findZoneSweep(candles, breakIndex, lastIndex, nearest.price, bullish: bullish);
+    if (swingSweep == null && zoneSweep == null) return null;
+
+    final sweepIndex = swingSweep?.sweepIndex ?? zoneSweep!.index;
+    final sweptExtremes = [
+      if (swingSweep != null) swingSweep.sweptExtreme,
+      if (zoneSweep != null) zoneSweep.extreme,
+    ];
+    final swingAnchor = sweptExtremes.reduce((a, b) => bullish ? min(a, b) : max(a, b));
+    final sweepLabel = swingSweep != null && zoneSweep != null
+        ? 'Liquidity Sweep (swing + zone)'
+        : swingSweep != null
+            ? 'Liquidity Sweep (swing)'
+            : 'Liquidity Sweep (zone)';
+
+    // Gate 5 — MSS/CHoCH.
+    final shiftLevel = _findStructureShift(candles, bullish: bullish, sweepIndex: sweepIndex);
+    if (shiftLevel == null) return null;
+
+    // Gate 6 — the shift must be carried by a decisive candle.
+    final pattern = _decisiveConfirmation(candles, lastIndex, bullish: bullish);
+    if (pattern == CandlePattern.none) return null;
+
+    final confluence = _isConfluenceZone(nearest, htfZones) ? ' + Confluence Zone' : '';
+    return ExecutionTrigger(
+      type: SetupType.htfRetest,
+      zone: HtfZone(
+        price: nearest.price,
+        source: '${nearest.source} ($sweepLabel + MSS @ \$${shiftLevel.toStringAsFixed(2)}$confluence)',
+      ),
+      pattern: pattern,
+      candleIndex: lastIndex,
+      swingAnchor: swingAnchor,
+      liquidityTarget: _findLiquidityTarget(candles, htfZones, entry: last.close, bullish: bullish),
+    );
+  }
+
+  /// Liquidity-sweep detection: a recent swing low (or high, when [bullish]
+  /// is false) that a later candle wicked through — taking the stops
+  /// resting beyond it — before closing back on the original side. Shared
+  /// (2026-09-18) by the HTF Retest Protocol above and IctEngine's
+  /// Liquidity-Sweep Reversal path, so "a sweep" means one thing in this
+  /// codebase; the returned [sweptExtreme] is what the Retest Protocol
+  /// anchors its Stop Loss behind.
+  ///
+  /// Scans every qualifying sweep in the window rather than returning the
+  /// first, and keeps the one that ran FURTHEST past its pivot — a stop
+  /// placed behind a shallower sweep would sit inside a deeper one that
+  /// already happened. [minSweepIndex] restricts which candles may count as
+  /// the sweeping candle (the Retest Protocol requires the sweep to happen
+  /// after the zone break; IctEngine leaves it at 0), while [lookback]
+  /// bounds how old the swept PIVOT itself may be.
+  ({Pivot pivot, int sweepIndex, double sweptExtreme})? findLiquiditySweep(
+    List<Candle> candles, {
+    required bool bullish,
+    int lookback = AppConfig.liquiditySweepLookback,
+    int minSweepIndex = 0,
+  }) {
+    final pivots = findPivots(candles);
+    final cutoff = (candles.length - lookback).clamp(0, candles.length);
+    ({Pivot pivot, int sweepIndex, double sweptExtreme})? deepest;
+
+    for (final pivot in pivots) {
+      if (pivot.type != (bullish ? PivotType.low : PivotType.high)) continue;
+      if (pivot.index < cutoff) continue;
+      for (int j = max(pivot.index + 1, minSweepIndex); j < candles.length; j++) {
+        final c = candles[j];
+        final wicked = bullish ? c.low < pivot.price : c.high > pivot.price;
+        final closedBack = bullish ? c.close > pivot.price : c.close < pivot.price;
+        if (!wicked || !closedBack) continue;
+        final extreme = bullish ? c.low : c.high;
+        final runsFurther = deepest == null ||
+            (bullish ? extreme < deepest.sweptExtreme : extreme > deepest.sweptExtreme);
+        if (runsFurther) {
+          deepest = (pivot: pivot, sweepIndex: j, sweptExtreme: extreme);
+        }
+      }
+    }
+    return deepest;
+  }
+
+  /// The most recent candle in `[start, end]` that swept the zone price
+  /// itself rather than a swing — [_isInstitutionalAbsorption]'s wick-
+  /// through/body-back footprint — paired with the extreme its wick
+  /// reached, for the same Stop Loss anchoring.
+  ({double extreme, int index})? _findZoneSweep(
+    List<Candle> candles,
+    int start,
+    int end,
+    double zonePrice, {
+    required bool bullish,
+  }) {
+    for (int i = end; i >= start; i--) {
+      if (!_isInstitutionalAbsorption(candles[i], zonePrice, isBullish: bullish)) continue;
+      return (extreme: bullish ? candles[i].low : candles[i].high, index: i);
+    }
     return null;
+  }
+
+  /// Market Structure Shift / CHoCH: after liquidity was taken at
+  /// [sweepIndex], the move is only confirmed once price closes beyond the
+  /// swing that framed the leg INTO that sweep — for a bullish setup, the
+  /// last swing high formed before the sweep candle. Returns that reference
+  /// level (for the trigger's label) or null when it hasn't been taken out,
+  /// or when no such swing exists yet.
+  double? _findStructureShift(List<Candle> candles, {required bool bullish, required int sweepIndex}) {
+    final wanted = bullish ? PivotType.high : PivotType.low;
+    Pivot? reference;
+    for (final pivot in findPivots(candles)) {
+      if (pivot.type != wanted || pivot.index >= sweepIndex) continue;
+      reference = pivot; // findPivots walks forward, so the last match is the most recent
+    }
+    if (reference == null) return null;
+
+    final close = candles.last.close;
+    final shifted = bullish ? close > reference.price : close < reference.price;
+    return shifted ? reference.price : null;
+  }
+
+  /// The confirmation standard for a Market Structure Shift: displacement
+  /// ([classifyMomentum]), an Engulfing, or a strong Absorption — in that
+  /// order of preference. A Pinbar or Doji is deliberately NOT accepted
+  /// here even though [classifyPattern] recognises it: a candle whose body
+  /// barely reaches past the level it supposedly broke is a wick through
+  /// structure, not a shift of it. Returns [CandlePattern.none] when the
+  /// candle fails all three, or qualifies in the wrong direction.
+  CandlePattern _decisiveConfirmation(List<Candle> candles, int index, {required bool bullish}) {
+    final momentum = classifyMomentum(candles, index);
+    if (momentum == (bullish ? CandlePattern.bullishMomentum : CandlePattern.bearishMomentum)) {
+      return momentum;
+    }
+    final engulfing = classifyPattern(candles, index);
+    if (engulfing == (bullish ? CandlePattern.bullishEngulfing : CandlePattern.bearishEngulfing)) {
+      return engulfing;
+    }
+    final absorption = classifyStrongAbsorption(candles, index);
+    if (absorption == (bullish ? CandlePattern.bullishAbsorption : CandlePattern.bearishAbsorption)) {
+      return absorption;
+    }
+    return CandlePattern.none;
+  }
+
+  /// The next place price is genuinely expected to react on the way to
+  /// profit: the NEAREST untapped swing high (or low, for a sell) or
+  /// [HtfZone] ahead of [entry]. The nearest one is deliberately chosen
+  /// over the most attractive — it is the first obstacle in the path, and
+  /// pricing Take Profit past it would be betting the move clears a level
+  /// this same engine treats as structure everywhere else. Null when
+  /// nothing sits ahead of Entry, which leaves RiskEngine on its fixed
+  /// [AppConfig.riskRewardRatio] multiple.
+  double? _findLiquidityTarget(
+    List<Candle> candles,
+    List<HtfZone> zones, {
+    required double entry,
+    required bool bullish,
+  }) {
+    final wanted = bullish ? PivotType.high : PivotType.low;
+    final ahead = <double>[
+      for (final pivot in findPivots(candles))
+        if (pivot.type == wanted) pivot.price,
+      for (final zone in zones) zone.price,
+    ].where((price) => bullish ? price > entry : price < entry).toList();
+
+    if (ahead.isEmpty) return null;
+    return ahead.reduce((a, b) => bullish ? min(a, b) : max(a, b));
   }
 
   /// Institutional Absorption / Strict Liquidity Sweep check (2026-09-10,
@@ -416,7 +593,10 @@ class TaEngine {
   /// (both open and close) stays strictly on the opposite, "safe" side of
   /// it. That combination is the real footprint of a liquidity sweep being
   /// absorbed by the opposing side at the level: a bare touch, or a body
-  /// that overlaps/crosses the zone itself, does not count.
+  /// that overlaps/crosses the zone itself, does not count. Since
+  /// 2026-09-18 this is the HTF Retest Protocol's zone-sweep reading (see
+  /// [_findZoneSweep]) — the fallback when no swing was swept — rather than
+  /// a confirmation test applied to the entry candle on its own.
   bool _isInstitutionalAbsorption(Candle candle, double zonePrice, {required bool isBullish}) {
     if (isBullish) {
       // Wick swept below the zone (liquidity grab) and the body closed
@@ -432,9 +612,12 @@ class TaEngine {
   /// (2026-09-11) — e.g. a Trendline crossing right through a Support/
   /// Resistance level, or a 1H zone sitting almost exactly on a 4H one.
   /// Two or more independent structural findings agreeing on nearly the
-  /// same price is a materially stronger signal than any single one alone,
-  /// which is what earns it the relaxed [findExecutionTrigger] Path A
-  /// eligibility (plain confirmed pattern, no required wick penetration).
+  /// same price is a materially stronger signal than any single one alone.
+  /// This used to earn such a zone a relaxed Path A eligibility; since
+  /// 2026-09-18 the HTF Retest Protocol holds every zone to the same
+  /// sequence, so confluence is reported as a quality tag on the fired
+  /// trigger's label (visible in logs, notifications and Telegram) instead
+  /// of waiving a requirement.
   bool _isConfluenceZone(HtfZone zone, List<HtfZone> zones) {
     for (final other in zones) {
       if (identical(other, zone)) continue;
@@ -444,96 +627,103 @@ class TaEngine {
     return false;
   }
 
-  bool _rangeHasClose(List<Candle> candles, int start, int end, bool Function(Candle) test) {
-    for (int i = start; i < end; i++) {
-      if (test(candles[i])) return true;
-    }
-    return false;
-  }
-
   // ---------------------------------------------------------------------
-  // 6) HIGHER LOW / LOWER HIGH ABSORPTION (15M-ONLY, 2026-09-10)
+  // 6) ABSORPTION PATTERN CLASSIFIER
   // ---------------------------------------------------------------------
-  /// A 15M-EXCLUSIVE execution pattern, structurally distinct from the
-  /// 1M/5M Reversal/Retest and Momentum/Breakout paths above: it reads the
-  /// relationship between the two most recent 15M candles rather than a
-  /// single candle's own wick/body shape —
-  /// Open-vs-prior-close relationship (2026-09-11, final revision — no
-  /// low/high comparison at all anymore, purely about the gap, or lack of
-  /// one, between the two candles' open/close):
-  ///  - Bullish Absorption (BUY): the current 15M candle is bullish,
-  ///    immediately follows a bearish 15M candle, and that PREVIOUS
-  ///    candle's close is at or BELOW the current candle's own open — no
-  ///    gap down between them (flat or gapped up) — "close الشمعة الحمراء
-  ///    الاخيرة قبل الصعود اوطى من قيمة open او تساويها للشمعة الخضراء
-  ///    الحالية".
-  ///  - Bearish Absorption (SELL): the current 15M candle is bearish,
-  ///    immediately follows a bullish 15M candle, and that PREVIOUS
-  ///    candle's close is strictly ABOVE the current candle's own open —
-  ///    a genuine gap down between them — "Close الشمعة الخضراء السابقة
-  ///    اعلى من open الشمعة الحمراء الحالية".
-  /// Either direction additionally requires the current candle's close to
-  /// sit within AppConfig.interestZoneBufferDollars of the nearest
-  /// [htfZones] entry — same Interest Area convention as the 1M/5M paths —
-  /// since this pattern is still only ever traded AT a pre-identified HTF
-  /// Key Zone, never in open air. [candleIndex] on the returned trigger is
-  /// the CURRENT candle; RiskEngine anchors the Stop Loss to the PREVIOUS
-  /// candle's own low/high (index - 1) per this pattern's definition, not
-  /// to the zone or the current candle's wick.
-  ///
-  /// STRICTLY requires the "current" candle to have actually CLOSED
-  /// (2026-09-10 fix): [candles15m]'s last element is frequently the
-  /// still-forming bar in a live feed — its own close is just the latest
-  /// tick, not a settled price, so evaluating the Higher-Low/Lower-High
-  /// relationship (and pricing Entry off it) against it is unsound; the
-  /// "low"/"high"/"close" being tested could still move for the rest of
-  /// that 15-minute window. This is the one thing that makes this pattern
-  /// different from the 1M/5M paths above, which intentionally react to
-  /// the forming candle for fast confirmation — a 15-minute window left
-  /// open is a much bigger risk window to price against. [candleIndex] on
-  /// the returned trigger always refers to a closed candle as a result.
-  /// Returns null when the last candle hasn't closed yet, when the
-  /// two-candle relationship doesn't hold, when price isn't near a zone,
-  /// or when [candles15m] has fewer than 2 candles / [htfZones] is empty.
-  ExecutionTrigger? find15mAbsorptionTrigger({
-    required List<Candle> candles15m,
-    required List<HtfZone> htfZones,
-  }) {
-    if (candles15m.length < 2 || htfZones.isEmpty) return null;
-    final lastIndex = candles15m.length - 1;
-    final curr = candles15m[lastIndex];
-    final prev = candles15m[lastIndex - 1];
+  // The standalone "15M Higher Low / Lower High Absorption" execution
+  // strategy (SetupType.absorption15m) that used to live here — a
+  // two-candle open/close relationship traded directly at any HTF zone —
+  // was retired 2026-09-18, explicit request. [classifyStrongAbsorption]
+  // below survives as a shared PATTERN classifier: the HTF Retest
+  // Protocol's own confirmation check (see [_decisiveConfirmation]) and
+  // ImpulseCorrectionEngine's Correction Termination Trigger both still
+  // use it to recognise genuine Absorption candles, just no longer as an
+  // independent path into a trade on its own.
+  // ---------------------------------------------------------------------
 
-    final candleCloseTime = curr.time.toUtc().add(const Duration(minutes: 15));
-    if (DateTime.now().toUtc().isBefore(candleCloseTime)) return null;
+  /// Absorption classifier + STRENGTH filter (2026-09-17, explicit
+  /// request: skip the entry when the Absorption pattern fails or shows
+  /// weakness). Returns [CandlePattern.none] both when the raw two-candle
+  /// shape isn't there AND when it is there but weak — a weak/failed
+  /// absorption is treated exactly like no absorption at all, so no setup
+  /// is ever built from it.
+  /// Thresholds: AppConfig.absorptionMinBodyDominance /
+  /// absorptionMinBodyRatio / absorptionMaxOpposingWickRatio.
+  CandlePattern classifyStrongAbsorption(List<Candle> candles, int index) {
+    if (index < 1 || index >= candles.length) return CandlePattern.none;
+    final curr = candles[index];
+    final prev = candles[index - 1];
 
-    CandlePattern? pattern;
+    final bool bullish;
     if (curr.isBullish && prev.isBearish && prev.close <= curr.open) {
-      pattern = CandlePattern.bullishAbsorption;
+      bullish = true;
     } else if (curr.isBearish && prev.isBullish && prev.close > curr.open) {
-      pattern = CandlePattern.bearishAbsorption;
+      bullish = false;
+    } else {
+      return CandlePattern.none;
     }
-    if (pattern == null) return null;
 
-    final nearest = findNearestZone(htfZones, curr.close);
-    if (nearest == null) return null;
-    final nearestDist = (curr.close - nearest.price).abs();
-    if (nearestDist > AppConfig.interestZoneBufferDollars + AppConfig.interestZoneToleranceDollars) return null;
+    // 1) Body dominance — the absorbing candle must be at least as big as
+    //    the candle it claims to have absorbed.
+    if (prev.bodySize > 0 &&
+        curr.bodySize < prev.bodySize * AppConfig.absorptionMinBodyDominance) {
+      return CandlePattern.none;
+    }
 
-    return ExecutionTrigger(
-      type: SetupType.absorption15m,
-      zone: HtfZone(
-        price: nearest.price,
-        source: '${nearest.source} (15M Higher Low / Lower High Absorption)',
-      ),
-      pattern: pattern,
-      candleIndex: lastIndex,
-    );
+    // 2) Conviction — mostly body, not a wide indecisive range.
+    if (curr.range <= 0) return CandlePattern.none;
+    if (curr.bodySize / curr.range < AppConfig.absorptionMinBodyRatio) {
+      return CandlePattern.none;
+    }
+
+    // 3) Follow-through — the close must actually take out the absorbed
+    //    candle's own origin, otherwise the absorption never completed.
+    if (bullish ? curr.close <= prev.open : curr.close >= prev.open) {
+      return CandlePattern.none;
+    }
+
+    // 4) Failure in real time — a large wick AGAINST the absorption means
+    //    price was pushed straight back out of the level.
+    final opposingWick = bullish ? curr.upperWick : curr.lowerWick;
+    if (opposingWick / curr.range > AppConfig.absorptionMaxOpposingWickRatio) {
+      return CandlePattern.none;
+    }
+
+    return bullish ? CandlePattern.bullishAbsorption : CandlePattern.bearishAbsorption;
   }
 
   /// Convenience: minimum/maximum helper used elsewhere.
   double roundTo(double v, int decimals) {
     final factor = pow(10, decimals);
     return (v * factor).round() / factor;
+  }
+
+  // ---------------------------------------------------------------------
+  // 7) AVERAGE TRUE RANGE (2026-09-18, for BreakoutMomentumEngine)
+  // ---------------------------------------------------------------------
+
+  /// Wilder's Average True Range as of the LAST candle in [candles] — the
+  /// standard smoothing every charting platform's ATR(period) uses (a
+  /// plain SMA of True Range reacts far more sharply to a single outlier
+  /// candle, which is exactly the noise this is meant to filter out).
+  /// True Range needs a PREVIOUS close, so this needs [period] + 1
+  /// candles; returns null when there aren't enough.
+  double? averageTrueRange(List<Candle> candles, {int period = 14}) {
+    if (candles.length < period + 1) return null;
+
+    final trueRanges = <double>[];
+    for (int i = 1; i < candles.length; i++) {
+      final c = candles[i];
+      final prevClose = candles[i - 1].close;
+      trueRanges.add([c.high - c.low, (c.high - prevClose).abs(), (c.low - prevClose).abs()].reduce(max));
+    }
+
+    // Seed with a plain average of the first [period] true ranges, then
+    // roll every later one in at Wilder's 1/period weight.
+    var atr = trueRanges.take(period).reduce((a, b) => a + b) / period;
+    for (int i = period; i < trueRanges.length; i++) {
+      atr = (atr * (period - 1) + trueRanges[i]) / period;
+    }
+    return atr;
   }
 }

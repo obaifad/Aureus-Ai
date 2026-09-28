@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:provider/provider.dart';
 import '../models/pivot.dart';
 import '../models/trade_setup.dart';
+import '../services/signal_monitor.dart';
 
 class SignalDetailScreen extends StatelessWidget {
   final TradeSetup setup;
@@ -32,11 +34,24 @@ class SignalDetailScreen extends StatelessWidget {
           ),
           const SizedBox(height: 24),
           _row(context, '⏰ Timeframe', setup.timeframeLabel),
-          _row(context, '🎯 Entry', '\$${setup.entry.toStringAsFixed(2)}'),
-          _row(context, '🛑 Stop Loss', '\$${setup.stopLoss.toStringAsFixed(2)}'),
+          _row(context, setup.actualFillPrice != null ? '🎯 Entry (Broker Fill)' : '🎯 Entry',
+              '\$${setup.effectiveEntry.toStringAsFixed(2)}'),
+          _row(context, setup.breakEvenActive ? '⚖️ Stop Loss (Break-Even)' : '🛑 Stop Loss',
+              '\$${setup.activeStopLoss.toStringAsFixed(2)}'),
           _row(context, '🟢 Take Profit', '\$${setup.takeProfit.toStringAsFixed(2)}'),
           _row(context, '📐 Risk : Reward', '1 : ${setup.riskRewardRatio.toStringAsFixed(1)}'),
           _row(context, '🕯️ Confirmation Pattern', setup.pattern.name),
+          if (setup.outcome == TradeOutcome.open) ...[
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () => context.read<SignalMonitor>().closeTradeManually(setup.uid),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+                child: const Text('Close Trade'),
+              ),
+            ),
+          ],
           const SizedBox(height: 20),
           Text('💡 AI Reason', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),

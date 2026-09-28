@@ -189,22 +189,13 @@ class IctEngine {
   /// True when a recent swing low was wicked through (liquidity grabbed
   /// below it) and price has already closed back above it — the setup for
   /// a bullish reversal. Symmetric (swing high / close back below) for a
-  /// bearish reversal when [bullish] is false.
-  bool _sweptLiquidityRecently(List<Candle> candles, {required bool bullish}) {
-    final pivots = _ta.findPivots(candles);
-    final relevant = pivots.where((p) => p.type == (bullish ? PivotType.low : PivotType.high));
-    final cutoff = (candles.length - AppConfig.ictLiquiditySweepLookback).clamp(0, candles.length);
-    for (final pivot in relevant) {
-      if (pivot.index < cutoff) continue;
-      for (int j = pivot.index + 1; j < candles.length; j++) {
-        final c = candles[j];
-        final wicked = bullish ? c.low < pivot.price : c.high > pivot.price;
-        final closedBack = bullish ? c.close > pivot.price : c.close < pivot.price;
-        if (wicked && closedBack) return true;
-      }
-    }
-    return false;
-  }
+  /// bearish reversal when [bullish] is false. Delegates to
+  /// [TaEngine.findLiquiditySweep] (2026-09-18), which the Top-Down HTF
+  /// Retest Protocol shares, so a "sweep" is detected identically in both
+  /// strategies; only this path discards the swept extreme, since its Stop
+  /// Loss is anchored to the confirmation candle instead.
+  bool _sweptLiquidityRecently(List<Candle> candles, {required bool bullish}) =>
+      _ta.findLiquiditySweep(candles, bullish: bullish) != null;
 
   // -----------------------------------------------------------------
   // Order Blocks — the last opposite-direction candle immediately before a
@@ -428,8 +419,8 @@ class IctEngine {
       final nearest = _ta.findNearestZone(htfZones, last.close);
       if (nearest == null) continue;
       if (!nearest.source.startsWith('1H') && !nearest.source.startsWith('4H')) continue;
-      final dist = (last.close - nearest.price).abs();
-      if (dist > AppConfig.interestZoneBufferDollars + AppConfig.interestZoneToleranceDollars) continue;
+      // Interest Area distance requirement removed (2026-09-14, explicit
+      // request) — Conditions 2/3 below still fully gate this trigger.
 
       // Condition 2 — liquidity was actually taken first.
       if (!_sweptLiquidityRecently(candles, bullish: bullish)) continue;
@@ -514,9 +505,9 @@ class IctEngine {
       if (direction != htfBias) continue;
 
       final linePrice = line.priceAt(lastIndex);
-      final dist = (last.close - linePrice).abs();
-      if (dist > AppConfig.interestZoneBufferDollars) continue;
 
+      // Interest Area distance requirement removed (2026-09-14, explicit
+      // request) — the "crowded" check right below still applies.
       // "ولم يكن هناك دعم او مقاومة قريب" — only take the trendline touch
       // when no OTHER (non-trendline) HTF zone already covers this price.
       final crowded = htfZones.any(
