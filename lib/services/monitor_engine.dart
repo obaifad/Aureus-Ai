@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
 import '../config/app_config.dart';
 import '../models/pivot.dart';
 import '../models/trade_setup.dart';
@@ -26,9 +28,9 @@ typedef MonitorEventSink = void Function(Map<String, Object?> event);
 /// races and the duplicate signals two independent SignalCheckers produced.
 class MonitorEngine {
   final MonitorEventSink onEvent;
-  MonitorEngine({required this.onEvent});
+  MonitorEngine({required this.onEvent, SignalChecker? checker}) : _checker = checker ?? SignalChecker();
 
-  final SignalChecker _checker = SignalChecker();
+  final SignalChecker _checker;
 
   TickStreamService? _ticks;
   StreamSubscription<Tick>? _tickSub;
@@ -151,7 +153,15 @@ class MonitorEngine {
     onEvent({'type': 'tick', 'bid': tick.bid, 'ask': tick.ask});
 
     if (_open.isEmpty) return;
-    final crossed = _open.any((s) => s.evaluateOutcomeAtTick(bid: tick.bid, ask: tick.ask) != null);
+    final brokerOwns = AppConfig.reconcileWithBroker;
+    bool crossesLocally(TradeSetup s) => s.evaluateOutcomeAtTick(bid: tick.bid, ask: tick.ask) != null;
+    // A trade backed by a real MT5 position is closed by the BROKER's own
+    // SL/TP. Seeing price cross its level is the cue to fetch that record
+    // now instead of waiting for the next scan.
+    if (brokerOwns && _open.any((s) => s.brokerTicket != null && crossesLocally(s))) {
+      _scheduleReconcile();
+    }
+    final crossed = _open.any((s) => !(brokerOwns && s.brokerTicket != null) && crossesLocally(s));
     if (!crossed) return;
 
     // Serialize: ticks keep arriving while storage is being updated. Only the
@@ -182,6 +192,36 @@ class MonitorEngine {
       _tickBusy = false;
     }
   }
+
+  DateTime? _lastReconcile;
+  bool _reconciling = false;
+
+  /// Debounced (one pass at a time, at most every 2 s): price can sit beyond
+  /// a level for many ticks while the broker's deal is still being booked.
+  void _scheduleReconcile() {
+    final now = DateTime.now();
+    if (_reconciling || (_lastReconcile != null && now.difference(_lastReconcile!) < const Duration(seconds: 2))) {
+      return;
+    }
+    _reconciling = true;
+    _lastReconcile = now;
+    unawaited(() async {
+      try {
+        final result = await _checker.reconcile();
+        if (result.changedAnything) {
+          await _refreshOpenCache();
+          onEvent({'type': 'history'});
+        }
+      } catch (e) {
+        AppLogger.log('Tick-triggered reconcile failed: $e');
+      } finally {
+        _reconciling = false;
+      }
+    }());
+  }
+
+  @visibleForTesting
+  Future<void> handleTickForTest(Tick tick) => _onTick(tick);
 
   void dispose() => stopTicks();
 }

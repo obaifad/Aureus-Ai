@@ -24,7 +24,21 @@ import 'package:aureus_ai/services/ta_engine.dart';
 import 'package:aureus_ai/services/zone_bounce_engine.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-const _key = 'kYiaZ8O4SlQ2yX7J3hM0tczRfujIxDETno';
+/// The bridge key is read from the environment (BRIDGE_API_KEY) or, failing that, from bridge/.env —
+/// it is never written into this file.
+String _loadKey() {
+  final fromEnv = Platform.environment['BRIDGE_API_KEY'];
+  if (fromEnv != null && fromEnv.isNotEmpty) return fromEnv;
+  final file = File('bridge/.env');
+  if (file.existsSync()) {
+    for (final line in file.readAsLinesSync()) {
+      if (line.startsWith('BRIDGE_API_KEY=')) return line.substring('BRIDGE_API_KEY='.length).trim();
+    }
+  }
+  throw StateError('Set BRIDGE_API_KEY or run from the project root with bridge/.env present.');
+}
+
+final String _key = _loadKey();
 
 Future<List<Candle>> fetch(int tf, int count) async {
   final uri = Uri.parse('http://127.0.0.1:8000/candles?symbol=XAUUSD...&timeframe=$tf&count=$count');
@@ -59,7 +73,7 @@ int score(TradeSetup s, ZoneBounceTrigger t) {
     CandlePattern.bullishPinbar || CandlePattern.bearishPinbar => 22,
     _ => 15,
   };
-  sc += t.zone.source.startsWith('4H') ? 30 : t.zone.source.startsWith('1H') ? 22 : 10;
+  sc += t.zone.source.startsWith('15M') ? 30 : 0;
   final pen = (t.isBuy ? t.zone.price - t.rejectionExtreme : t.rejectionExtreme - t.zone.price)
       .clamp(0.0, double.infinity);
   sc += (pen / AppConfig.zoneBounceTouchDollars * 20).clamp(0.0, 20.0).round();

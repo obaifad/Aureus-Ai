@@ -59,6 +59,15 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^4.0.0
 
+# The Windows half of flutter_local_notifications (2026-10-09): a local copy of the published 2.0.1 whose native
+# FFI functions catch every C++ exception (see third_party/flutter_local_notifications_windows/src/ffi_api.cpp).
+# Upstream lets a WinRT error from ToastNotifier::Show (0x803E0105, the Windows notification service briefly
+# unavailable) escape into the Flutter engine, which aborts the whole app - the crashes right after opening a
+# trade on 2026-10-05 and 2026-10-08. Drop this override once an upstream release catches it.
+dependency_overrides:
+  flutter_local_notifications_windows:
+    path: third_party/flutter_local_notifications_windows
+
 flutter:
   uses-material-design: true
   assets:

@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:provider/provider.dart';
+import 'config/app_config.dart';
+import 'config/local_env.dart';
 import 'screens/home_screen.dart';
 import 'services/app_logger.dart';
 import 'services/signal_monitor.dart';
@@ -30,11 +32,22 @@ Future<void> main() async {
 
   // Loads .env if present; if missing, AppConfig falls back to safe
   // defaults (mock data mode) so the app still runs out of the box.
+  // A file beside the app (never bundled) may add or override values, so a build can
+  // carry no secret and each machine supplies its own BRIDGE_API_KEY locally.
+  final local = await LocalEnv.load();
   try {
-    await dotenv.load(fileName: '.env');
+    await dotenv.load(fileName: '.env', mergeWith: local.isEmpty ? const {} : local);
   } catch (e) {
     AppLogger.log('.env not found ($e) — running in mock data mode');
     dotenv.testLoad(fileInput: 'USE_MOCK_DATA=true');
+  }
+
+  if (LocalEnv.loadedFrom != null) {
+    AppLogger.log('Local settings loaded from ${LocalEnv.loadedFrom} (${LocalEnv.providedKeys.length} value(s), '
+        'keys: ${LocalEnv.providedKeys.join(", ")})');
+  }
+  for (final warning in AppConfig.bundledSecretWarnings) {
+    AppLogger.log('SECURITY: $warning');
   }
 
   runApp(const AureusAiApp());

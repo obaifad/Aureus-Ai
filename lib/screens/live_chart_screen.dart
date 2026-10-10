@@ -173,7 +173,7 @@ class _LiveChartScreenState extends State<LiveChartScreen> {
   @override
   Widget build(BuildContext context) {
     final monitor = context.watch<SignalMonitor>();
-    final openTrades = monitor.history.where((s) => s.outcome == TradeOutcome.open).toList();
+    final openTrades = monitor.history.where((s) => s.outcome == TradeOutcome.open && !s.isMissed).toList();
     final livePrice = _candles.isNotEmpty ? _candles.last.close : null;
 
     return Scaffold(
@@ -474,7 +474,8 @@ class _ChartPainter extends CustomPainter {
       textDirection: TextDirection.ltr,
     )..layout();
     if (background != null) {
-      canvas.drawRect(Rect.fromLTWH(at.dx - 3, at.dy - 2, painter.width + 6, painter.height + 4), Paint()..color = background);
+      canvas.drawRect(
+          Rect.fromLTWH(at.dx - 3, at.dy - 2, painter.width + 6, painter.height + 4), Paint()..color = background);
     }
     painter.paint(canvas, at);
   }

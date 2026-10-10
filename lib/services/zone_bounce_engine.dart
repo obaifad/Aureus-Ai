@@ -1,4 +1,5 @@
 import '../config/app_config.dart';
+import 'strategy_config_service.dart';
 import '../models/candle.dart';
 import '../models/pivot.dart';
 import 'ta_engine.dart';
@@ -94,8 +95,9 @@ class ZoneBounceEngine {
     required List<Candle> candles,
     required List<HtfZone> zones,
     required TradeDirection? htfBias,
+    List<HtfZone>? candidateZones,
   }) =>
-      diagnose(candles: candles, zones: zones, htfBias: htfBias).trigger;
+      diagnose(candles: candles, zones: zones, htfBias: htfBias, candidateZones: candidateZones).trigger;
 
   /// [findTrigger] with the REASON attached when nothing fires. Not a
   /// second implementation: [findTrigger] is a thin wrapper over this, so a
@@ -106,10 +108,19 @@ class ZoneBounceEngine {
   /// reasons, the reason reported is the one that got FURTHEST through the
   /// gates (the order of [ZoneBounceReject]) — the most informative answer
   /// to "how close was this to a trade".
+  ///
+  /// [zones] is every level the market has, and it is what the RANGE is
+  /// measured against (the far side that caps Take Profit, see
+  /// [_opposingBoundary]). [candidateZones], when given, narrows which of
+  /// them the engine may BOUNCE off — it never changes the range. SignalChecker
+  /// passes only the 15M levels (2026-10-07): bounces off 1H/4H levels lost money
+  /// in every period measured, while a 1H/4H level that bounds the range is
+  /// still a perfectly good far side. Null = every zone is a candidate.
   ZoneBounceDiagnosis diagnose({
     required List<Candle> candles,
     required List<HtfZone> zones,
     required TradeDirection? htfBias,
+    List<HtfZone>? candidateZones,
   }) {
     // Gate 1 — ranging only. A CLEAR bias means the trend engines own
     // this market; this tier stands down entirely rather than adding a
@@ -123,10 +134,14 @@ class ZoneBounceEngine {
     final candle = candles[index];
     if (candle.range <= 0) return const ZoneBounceDiagnosis.rejected(ZoneBounceReject.insufficientData);
 
+    // No level this engine may bounce off (e.g. only 1H/4H levels exist): nothing was touched.
+    final pool = candidateZones ?? zones;
+    if (pool.isEmpty) return const ZoneBounceDiagnosis.rejected(ZoneBounceReject.noZoneTouched);
+
     final candidates = <ZoneBounceTrigger>[];
     final rejects = <ZoneBounceReject>[];
     for (final zone in _ta.findNearestZones(
-      zones,
+      pool,
       candle.close,
       count: AppConfig.zoneBounceEvaluatedZoneCount,
     )) {
@@ -341,9 +356,10 @@ class ZoneBounceEngine {
   /// backtest.
   double takeProfitFor(ZoneBounceTrigger trigger, {required double entry, required double stopLoss}) {
     final risk = (entry - stopLoss).abs();
+    final rr = AppConfig.rrFor(EngineIds.rangeBounce);
     final target = trigger.isBuy
-        ? entry + AppConfig.riskRewardRatio * risk
-        : entry - AppConfig.riskRewardRatio * risk;
+        ? entry + rr * risk
+        : entry - rr * risk;
 
     final boundary = trigger.rangeBoundary;
     if (boundary == null || risk <= 0) return target;

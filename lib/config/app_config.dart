@@ -3,6 +3,9 @@ import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
+import '../services/strategy_config_service.dart';
+import 'local_env.dart';
+
 /// Central place for every configurable value in Aureus AI.
 /// Values are loaded from a local `.env` file (see `.env.example`).
 ///
@@ -119,6 +122,15 @@ class AppConfig {
   /// never had the legs to reach, not from bad entries.
   static const double riskRewardRatio = 1.8;
 
+  /// The reward-to-risk multiple [engineId] prices its Take Profit at: the
+  /// engine's own target from the bridge config, else the config's default,
+  /// else the built-in [riskRewardRatio]. Trades already open keep the target
+  /// they were opened with.
+  static double rrFor(String engineId) {
+    final config = StrategyConfig.instance.current;
+    return config.engineRiskReward(engineId) ?? config.defaultRiskReward ?? riskRewardRatio;
+  }
+
   // NOTE: there is deliberately no minimum Stop Loss floor (removed
   // 2026-09-10 — see RiskEngine.buildTradeSetup): the SL always sits at
   // whatever the structural distance actually is; the user sizes their own
@@ -208,7 +220,8 @@ class AppConfig {
   /// setup is rejected rather than re-priced to a TP nothing supports.
   /// Deliberately below [riskRewardRatio]: a 1:2 floor here would throw
   /// away otherwise-clean retests purely for having honest, nearby targets.
-  static const double htfRetestMinRiskReward = 1.5;
+  static double get htfRetestMinRiskReward => _paramDouble(EngineIds.htfRetest, 'min_rr', htfRetestMinRiskRewardDefault);
+  static const double htfRetestMinRiskRewardDefault = 1.5;
 
   // ---------------------------------------------------------------------
   // ICT / Smart-Money-Concepts strategy (ict_engine.dart) — an INDEPENDENT
@@ -269,7 +282,41 @@ class AppConfig {
   /// (mirroring [minConfluenceScoreScalping]'s precedent for 1M scalps) it
   /// needs a materially higher score than the other, with-trend ICT paths,
   /// which use the standard [minConfluenceScore] floor.
-  static const int minConfluenceScoreIctReversal = 70;
+  static int get minConfluenceScoreIctReversal => _paramInt(EngineIds.ict, 'min_confluence_reversal', minConfluenceScoreIctReversalDefault);
+  static const int minConfluenceScoreIctReversalDefault = 70;
+
+  // ---------------------------------------------------------------------
+  // Market-dynamics safety layers (2026-10-07): the Liquidity-Sweep Reversal
+  // realignment below, the Fast-Impulse Guard and the Volatility / Chaos
+  // Filter further down. Each has a mode — off | shadow | block — owned by
+  // the bridge config. SHADOW (the default, and what applies with no bridge)
+  // evaluates and records what it would have rejected but never blocks, so a
+  // layer is verified against real trades before it can stop one. All the
+  // thresholds live in the bridge config too; the `*Default` next to each
+  // getter is what applies when it has no value.
+  // ---------------------------------------------------------------------
+
+  /// The ICT Liquidity-Sweep Reversal is a counter-structure model, so it is only allowed (a) when it
+  /// agrees with the 4H+1H structure bias, or (b) — with NO clear bias — when the sweep took the liquidity
+  /// at the boundary of a real, non-trending range. A reversal against a clear bias is rejected.
+  static GuardMode get ictSweepMode =>
+      GuardMode.parse(StrategyConfig.instance.current.engineParamStr(EngineIds.ict, 'sweep_mode'));
+
+  /// How many 15M candles BEFORE the sweep make up the range whose boundary it must reach.
+  static int get ictSweepRangeLookback => _paramInt(EngineIds.ict, 'sweep_range_lookback', ictSweepRangeLookbackDefault);
+  static const int ictSweepRangeLookbackDefault = 48;
+
+  /// The range must be at least this tall (in ATR) to count as a range rather than noise.
+  static double get ictSweepMinRangeAtr => _paramDouble(EngineIds.ict, 'sweep_min_range_atr', ictSweepMinRangeAtrDefault);
+  static const double ictSweepMinRangeAtrDefault = 2.0;
+
+  /// How close (in ATR) the sweep's extreme must come to — or pass beyond — the range boundary.
+  static double get ictSweepBoundaryAtr => _paramDouble(EngineIds.ict, 'sweep_boundary_atr', ictSweepBoundaryAtrDefault);
+  static const double ictSweepBoundaryAtrDefault = 0.5;
+
+  /// A range that already trended (net move / path length of the closes above this) is not a range.
+  static double get ictSweepMaxEfficiency => _paramDouble(EngineIds.ict, 'sweep_max_efficiency', ictSweepMaxEfficiencyDefault);
+  static const double ictSweepMaxEfficiencyDefault = 0.35;
 
   // ---------------------------------------------------------------------
   // Impulse-Correction-Impulse strategy (impulse_correction_engine.dart) —
@@ -286,12 +333,14 @@ class AppConfig {
   /// reuses the exact same "decisive candle" threshold TaEngine.
   /// classifyMomentum already uses, so "strong expansion" means the same
   /// thing everywhere in this codebase.
-  static const double iciMinImpulseBodyRatio = 0.65;
+  static double get iciMinImpulseBodyRatio => _paramDouble(EngineIds.ici, 'min_impulse_body_ratio', iciMinImpulseBodyRatioDefault);
+  static const double iciMinImpulseBodyRatioDefault = 0.65;
 
   /// Impulse 1 must be at least this many CONSECUTIVE same-direction
   /// candles (each clearing [iciMinImpulseBodyRatio]) to count as a
   /// genuine expansion leg, not just one decisive bar.
-  static const int iciMinConsecutiveImpulseCandles = 2;
+  static int get iciMinConsecutiveImpulseCandles => _paramInt(EngineIds.ici, 'min_consecutive_impulse', iciMinConsecutiveImpulseCandlesDefault);
+  static const int iciMinConsecutiveImpulseCandlesDefault = 2;
 
   /// The correction phase's retracement into Impulse 1's own range must
   /// fall inside [iciFibRetracementMin, iciFibRetracementMax] (the classic
@@ -310,7 +359,8 @@ class AppConfig {
   /// Correction Termination Trigger #2 (Rejection Wick): the confirmation
   /// candle's rejecting wick must be at least this fraction of its own
   /// total high-low range.
-  static const double iciMinRejectionWickRatio = 0.5;
+  static double get iciMinRejectionWickRatio => _paramDouble(EngineIds.ici, 'min_rejection_wick_ratio', iciMinRejectionWickRatioDefault);
+  static const double iciMinRejectionWickRatioDefault = 0.5;
 
   /// Dynamic ATR-based Stop Loss (2026-09-24, explicit request — replaced
   /// the fixed $1.50 `iciMinStopLossDollars` floor this strategy used from
@@ -332,7 +382,8 @@ class AppConfig {
   /// also re-prices Take Profit off the final risk so [riskRewardRatio]
   /// still holds.
   static const double iciSlAtrMultiplier = 1.5;
-  static const double iciMinStopLossPips = 30.0;
+  static double get iciMinStopLossPips => _paramDouble(EngineIds.ici, 'min_sl_pips', iciMinStopLossPipsDefault);
+  static const double iciMinStopLossPipsDefault = 30.0;
 
   /// How many recent candles Impulse 1 is still eligible from before it's
   /// considered too old to trade a correction/continuation against.
@@ -414,34 +465,99 @@ class AppConfig {
   static const double absorptionMaxOpposingWickRatio = 0.35;
 
   // ---------------------------------------------------------------------
-  // Opening Range Breakout strategy (orb_engine.dart, 2026-09-18) — a
-  // fourth INDEPENDENT strategy layer, deliberately isolated from the
-  // Strict Top-Down/ICT/ICI logic above: no HTF zone, structure bias, or
-  // candlestick pattern involved at all. The Opening Range is the high/low
-  // of the first [orbRangeMinutes] of a session (reusing [londonSessionStartUtc]
-  // / [newYorkSessionStartUtc] above as the session anchors, so "the London
-  // session" means the exact same UTC hour everywhere in this codebase);
-  // a CLOSED 5M candle (never a wick) beyond that range is the breakout;
-  // a mandatory retest of the broken boundary (price trading back to it and
-  // closing beyond it again) is required before the entry actually fires
-  // (2026-09-18, explicit request — the old immediate no-retest entry mode
-  // was removed). Off by default: unlike every other tier, ORB needs its
-  // own 5M candle
-  // fetch (SignalChecker only fetches 4H/1H/15M otherwise, per the
-  // "completely disable Scalping strategies" decision above) — enabling it
-  // adds real request volume against the same TwelveData/Yahoo quota that
-  // decision was protecting, so it's opt-in rather than on by default.
+  // Asia Opening Range Breakout (orb_engine.dart; rebuilt 2026-10-09 as the
+  // fifth engine, replacing the old London/New York ORB) — an INDEPENDENT
+  // strategy layer, deliberately isolated from the Top-Down/ICT/ICI logic
+  // above: no HTF zone, structure bias, or candlestick pattern involved at
+  // all. The Opening Range is the high/low (wicks included) of the first
+  // [orbRangeMinutes] after [orbAsiaOpenUtcHour] (01:00 UTC); a CLOSED 5M
+  // candle (never a wick) beyond it is the breakout; a mandatory retest of
+  // the broken edge (price trading back to it and closing beyond it again)
+  // fires the entry, before [orbEntryUntilUtcHour]. SL behind the range's
+  // far side, TP [orbRiskRewardDefault] R. No trend gate and DXY-exempt by
+  // default — exactly the rules that were replayed. Off by default: ORB
+  // needs its own 5M candle fetch.
   // ---------------------------------------------------------------------
 
   /// Master toggle — SignalChecker never fetches 5M candles or evaluates
   /// ORBEngine at all while this is false.
-  static bool get useOrb => (_env('USE_ORB') ?? 'false').toLowerCase().trim() == 'true';
+  static bool get useOrb => StrategyConfig.instance.current.engineEnabled(EngineIds.orb) ?? useOrbEnv;
+  static bool get useOrbEnv => (_env('USE_ORB') ?? 'false').toLowerCase().trim() == 'true';
 
-  /// Which sessions ORBEngine watches. Both default to true (matching the
-  /// request's "configurable for London and New York") — set either to
-  /// false in .env to trade only the other.
-  static bool get orbLondonEnabled => (_env('ORB_LONDON_ENABLED') ?? 'true').toLowerCase().trim() == 'true';
-  static bool get orbNewYorkEnabled => (_env('ORB_NEWYORK_ENABLED') ?? 'true').toLowerCase().trim() == 'true';
+  /// Master switches for the three engines that never had a `.env` flag
+  /// (they always ran). The bridge config can now turn each one off;
+  /// without it they stay on, exactly as before.
+  // ---------------------------------------------------------------------
+  // Engine thresholds. The bridge config (engines.<id>.params.*) is the
+  // owner; the `*Env` / `*Default` value next to each getter is what applies
+  // when the bridge has no value (mock/standalone mode, an outage).
+  // ---------------------------------------------------------------------
+  static double _paramDouble(String engine, String key, double fallback) =>
+      StrategyConfig.instance.current.engineParamNum(engine, key) ?? fallback;
+  static int _paramInt(String engine, String key, int fallback) =>
+      StrategyConfig.instance.current.engineParamNum(engine, key)?.round() ?? fallback;
+  static bool _paramBool(String engine, String key, bool fallback) =>
+      StrategyConfig.instance.current.engineParamBool(engine, key) ?? fallback;
+  static String _paramString(String engine, String key, String fallback) =>
+      (StrategyConfig.instance.current.engineParamStr(engine, key) ?? fallback).toLowerCase().trim();
+
+  /// What `.env` (or the built-in default) says for every bridge-tunable threshold. Used once, to
+  /// move a tuned `.env` into the bridge so nothing changes behaviour silently.
+  static Map<String, Map<String, Object>> get engineParamsFromEnv => {
+        EngineIds.orb: {
+          'sl_pips_override': orbStopLossPipsOverrideEnv,
+          'tp_pips_override': orbTakeProfitPipsOverrideEnv,
+        },
+        EngineIds.breakout: {
+          'min_body_atr': breakoutMinBodyToAtrRatioEnv,
+          'max_body_atr': breakoutMaxBodyToAtrRatioEnv,
+          'close_location': breakoutCloseLocationThresholdEnv,
+          'min_range_expansion': breakoutMinRangeToAvgRatioEnv,
+          'max_entry_distance_atr': breakoutMaxEntryDistanceAtrEnv,
+          'require_retest': breakoutRequireRetestEnv,
+          'retest_lookback': breakoutRetestLookbackCandlesEnv,
+          'retest_tolerance_dollars': breakoutRetestToleranceDollarsEnv,
+          'failed_reversal': breakoutFailedReversalEnabledEnv,
+          'sl_atr': breakoutSlAtrMultiplierEnv,
+          'htf_mode': breakoutHtfModeEnv,
+        },
+        EngineIds.rangeBounce: {
+          'touch_dollars': zoneBounceTouchDollarsEnv,
+          'min_wick_ratio': zoneBounceMinWickRatioEnv,
+          'break_lookback': zoneBounceBreakLookbackEnv,
+          'sl_atr': zoneBounceSlAtrMultiplierEnv,
+          'min_boundary_r': zoneBounceMinBoundaryREnv,
+          'min_rr': zoneBounceMinRiskRewardEnv,
+          'zone_count': zoneBounceEvaluatedZoneCountEnv,
+        },
+        EngineIds.htfRetest: {
+          'min_rr': htfRetestMinRiskRewardDefault,
+        },
+        EngineIds.ict: {
+          'min_confluence_reversal': minConfluenceScoreIctReversalDefault,
+        },
+        EngineIds.ici: {
+          'min_impulse_body_ratio': iciMinImpulseBodyRatioDefault,
+          'min_consecutive_impulse': iciMinConsecutiveImpulseCandlesDefault,
+          'min_rejection_wick_ratio': iciMinRejectionWickRatioDefault,
+          'min_sl_pips': iciMinStopLossPipsDefault,
+        },
+      };
+
+  static bool get useHtfRetest => StrategyConfig.instance.current.engineEnabled(EngineIds.htfRetest) ?? true;
+  static bool get useIct => StrategyConfig.instance.current.engineEnabled(EngineIds.ict) ?? true;
+  static bool get useIci => StrategyConfig.instance.current.engineEnabled(EngineIds.ici) ?? true;
+
+  /// The Asian open the Opening Range is built from: 01:00 UTC = 09:00 in Shanghai/Hong Kong, when the Chinese
+  /// gold market opens. Neither city observes daylight saving, so this UTC hour never shifts.
+  static const int orbAsiaOpenUtcHour = 1;
+
+  /// Last moment (UTC hour, same day) a breakout AND its retest may complete — the end of the Asian session.
+  static const int orbEntryUntilUtcHour = 7;
+
+  /// ORB's Take Profit in R when the bridge config gives the engine no `rr` of its own. 2.0, not the global
+  /// default: the replayed Asia ORB was profitable because its winners run (at 1:1 it lost money).
+  static const double orbRiskRewardDefault = 2.0;
 
   /// Stop Loss / Take Profit sizing for ORB setups specifically ("Allow
   /// dynamic/configurable SL and TP settings", explicit request). Dynamic
@@ -453,14 +569,24 @@ class AppConfig {
   /// Setting either override here in .env switches that ONE side to a
   /// fixed pip distance from Entry instead (0 — the default — means
   /// "use the dynamic value").
-  static double get orbStopLossPipsOverride => double.tryParse(_env('ORB_STOP_LOSS_PIPS') ?? '') ?? 0;
-  static double get orbTakeProfitPipsOverride => double.tryParse(_env('ORB_TAKE_PROFIT_PIPS') ?? '') ?? 0;
+  static double get orbStopLossPipsOverride => _paramDouble(EngineIds.orb, 'sl_pips_override', orbStopLossPipsOverrideEnv);
+  static double get orbStopLossPipsOverrideEnv => double.tryParse(_env('ORB_STOP_LOSS_PIPS') ?? '') ?? 0;
+  static double get orbTakeProfitPipsOverride => _paramDouble(EngineIds.orb, 'tp_pips_override', orbTakeProfitPipsOverrideEnv);
+  static double get orbTakeProfitPipsOverrideEnv => double.tryParse(_env('ORB_TAKE_PROFIT_PIPS') ?? '') ?? 0;
 
   /// ORB's own Confluence Score floor — the standard [minConfluenceScore],
   /// since a confirmed-retest ORB entry is a comparably strong signal to a
   /// with-trend HTF Retest (see OrbEngine's confluence scoring in
   /// SignalChecker._evaluateOrbTrigger).
   static const int minConfluenceScoreOrb = minConfluenceScore;
+
+  /// Opening Range height, in 5M ATR(14) multiples, that scores as a healthy
+  /// range. Narrower ranges break on noise; much wider ones mean the move
+  /// already happened inside the range.
+  static const double orbIdealRangeMinAtr = 1.0;
+  static const double orbIdealRangeMaxAtr = 3.0;
+  static const double orbAcceptableRangeMinAtr = 0.6;
+  static const double orbAcceptableRangeMaxAtr = 4.5;
 
   /// How long the Opening Range window is, in minutes — narrowed 30 -> 15
   /// (2026-09-24, explicit request: "لorb نزلت لشمعة الربع ساعة بدال النص
@@ -478,25 +604,9 @@ class AppConfig {
   /// from); OrbEngine.computeRange derives its required candle count from
   /// this value rather than hard-coding one.
   static const int orbRangeMinutes = 15;
-
-  /// How long a formed Opening Range stays TRADEABLE, in hours, measured
-  /// from the moment the range window closes (2026-09-24, explicit
-  /// request: "اي حطلو حد ساعتين"). Past this deadline the range is dead
-  /// for the day: OrbEngine.findTrigger stops looking at candles beyond it
-  /// and returns null, so no entry can fire off it any more.
-  ///
-  /// Why it was needed: findTrigger used to scan EVERY candle after the
-  /// range with no time bound at all, which in the reviewed session
-  /// produced a New York ORB BUY at 18:26 UTC — more than six hours after
-  /// that range closed at 12:15. An opening range describes the first
-  /// hour or two of a session's participation; a "breakout" of it six
-  /// hours later is just an unrelated level break wearing the strategy's
-  /// name, and that trade was one of the day's two full losses.
-  ///
-  /// Applied to the CANDLES, not merely to the clock, so a scan that runs
-  /// late (app asleep, Doze, restart) still can't reach back and fire off
-  /// a breakout that happened after the deadline.
-  static const int orbMaxHoursAfterRange = 2;
+  // The tradeable window of a formed range now ends at [orbEntryUntilUtcHour] (07:00 UTC) instead of a fixed
+  // 2 hours after the range: the Asian session's moves take longer to come back to the edge than London's or New
+  // York's did. It is still applied to the CANDLES, not merely the clock (see OrbEngine.deadline/findTrigger).
 
   /// One Active Trade Limit (2026-09-17): while ANY trade is open, no engine
   /// is evaluated at all. On by default. Turning it off (2026-09-25) lets
@@ -505,7 +615,38 @@ class AppConfig {
   /// the backtest can MEASURE what the limit costs; concurrent positions
   /// stack real exposure (each is sized on its own), so it should not be
   /// switched off casually on a live account.
-  static bool get oneActiveTradeLimit => _envBool('ONE_ACTIVE_TRADE_LIMIT', true);
+  static bool get oneActiveTradeLimit =>
+      StrategyConfig.instance.current.oneActiveTrade ?? oneActiveTradeLimitEnv;
+  static bool get oneActiveTradeLimitEnv => _envBool('ONE_ACTIVE_TRADE_LIMIT', true);
+
+  /// Magic numbers this system stamps on its MT5 orders (the legacy shared
+  /// one plus one per engine). Reconciliation only ADOPTS positions carrying
+  /// one of these — a position you opened by hand is never pulled into the
+  /// signal history or its statistics.
+  static const Set<int> aureusMagicNumbers = {
+    20260920,
+    20260921,
+    20260922,
+    20260923,
+    20260924,
+    20260925,
+    20260926,
+  };
+
+  /// Broker reconciliation: for trades backed by a real MT5 position the
+  /// broker's own record is the truth (closes, prices, profit), and the
+  /// app's estimate-based sweep stands aside. Only meaningful with a live
+  /// bridge; set RECONCILE_WITH_BROKER=false to go back to estimates only.
+  static bool get reconcileWithBroker =>
+      _envBool('RECONCILE_WITH_BROKER', true) && !useMockData && !disableMt5Bridge;
+
+  /// Daily loss circuit breaker: after this many CONSECUTIVE losing trades
+  /// closed on the same UTC day, no engine is evaluated until the next UTC
+  /// day. A losing streak in one session usually means choppy conditions
+  /// every engine misreads alike (Sep 30: four stops in a row, 11-46 min
+  /// each). 0 disables it. 3, not 2: on the Sep 24-30 backtest a limit of 2
+  /// halted Sep 25 after two losses and skipped +443.7 pips of wins.
+  static int get dailyLossStreakLimit => int.tryParse(_env('DAILY_LOSS_STREAK_LIMIT') ?? '') ?? 3;
 
   // ---------------------------------------------------------------------
   // Ranging Market Module — Zone Bounce Protocol (zone_bounce_engine.dart,
@@ -529,6 +670,8 @@ class AppConfig {
   /// on genuinely changes which markets the app trades in (ranging ones),
   /// so it should be a deliberate choice rather than something inherited.
   static bool get enableRangingBounceMode =>
+      StrategyConfig.instance.current.engineEnabled(EngineIds.rangeBounce) ?? enableRangingBounceModeEnv;
+  static bool get enableRangingBounceModeEnv =>
       (_env('ENABLE_RANGING_BOUNCE') ?? 'false').toLowerCase().trim() == 'true';
 
   /// How close the rejection candle's wick must come to a level to count as
@@ -536,7 +679,8 @@ class AppConfig {
   /// [interestZoneBufferDollars] (the Top-Down "near a zone" buffer): this
   /// is a rejection OFF a specific price, not a trade taken in a zone's
   /// general neighbourhood.
-  static double get zoneBounceTouchDollars => _envDouble('ZONE_BOUNCE_TOUCH_DOLLARS', 1.0);
+  static double get zoneBounceTouchDollars => _paramDouble(EngineIds.rangeBounce, 'touch_dollars', zoneBounceTouchDollarsEnv);
+  static double get zoneBounceTouchDollarsEnv => _envDouble('ZONE_BOUNCE_TOUCH_DOLLARS', 1.0);
 
   /// Minimum rejection-wick share of the candle's total range for the
   /// third, looser rejection shape (the first two — Pinbar and Engulfing —
@@ -545,26 +689,30 @@ class AppConfig {
   /// perfectly good rejections that happen to close mid-range; this accepts
   /// those, while still requiring the close to finish in the trade's favour
   /// within the candle's own range.
-  static double get zoneBounceMinWickRatio => _envDouble('ZONE_BOUNCE_MIN_WICK_RATIO', 0.5);
+  static double get zoneBounceMinWickRatio => _paramDouble(EngineIds.rangeBounce, 'min_wick_ratio', zoneBounceMinWickRatioEnv);
+  static double get zoneBounceMinWickRatioEnv => _envDouble('ZONE_BOUNCE_MIN_WICK_RATIO', 0.5);
 
   /// How many candles back the engine checks for a decisive close THROUGH
   /// the level before accepting a bounce off it. A level broken within this
   /// window is a broken level being retested — the Top-Down protocol's
   /// territory, with its own sweep/structure-shift gates — not a range
   /// boundary that is holding.
-  static int get zoneBounceBreakLookback => _envInt('ZONE_BOUNCE_BREAK_LOOKBACK', 10);
+  static int get zoneBounceBreakLookback => _paramInt(EngineIds.rangeBounce, 'break_lookback', zoneBounceBreakLookbackEnv);
+  static int get zoneBounceBreakLookbackEnv => _envInt('ZONE_BOUNCE_BREAK_LOOKBACK', 10);
 
   /// Stop Loss buffer BEYOND the rejection wick's extreme, as a multiple of
   /// ATR(14). The larger of this and [slBufferDollars] wins, so the stop
   /// widens with volatility instead of sitting at a constant distance that
   /// is too tight on a busy day.
-  static double get zoneBounceSlAtrMultiplier => _envDouble('ZONE_BOUNCE_SL_ATR', 0.5);
+  static double get zoneBounceSlAtrMultiplier => _paramDouble(EngineIds.rangeBounce, 'sl_atr', zoneBounceSlAtrMultiplierEnv);
+  static double get zoneBounceSlAtrMultiplierEnv => _envDouble('ZONE_BOUNCE_SL_ATR', 0.5);
 
   /// Adaptive Target rule (2026-09-25): the range's opposing boundary only
   /// clips Take Profit when it lies at least this many R from Entry. A
   /// nearer boundary is ignored and Take Profit stays at exactly
   /// [riskRewardRatio]. See ZoneBounceEngine.takeProfitFor.
-  static double get zoneBounceMinBoundaryR => _envDouble('ZONE_BOUNCE_MIN_BOUNDARY_R', 1.0);
+  static double get zoneBounceMinBoundaryR => _paramDouble(EngineIds.rangeBounce, 'min_boundary_r', zoneBounceMinBoundaryREnv);
+  static double get zoneBounceMinBoundaryREnv => _envDouble('ZONE_BOUNCE_MIN_BOUNDARY_R', 1.0);
 
   /// Take Profit can be clipped to the range's opposing boundary (when that
   /// is at least [zoneBounceMinBoundaryR] away), so the realised R:R can
@@ -572,7 +720,8 @@ class AppConfig {
   /// rejected outright rather than taken for a poor payoff. Note it sits
   /// ABOVE [zoneBounceMinBoundaryR], so a boundary between the two clips a
   /// setup into a rejection — a deliberate, separately tunable trade-off.
-  static double get zoneBounceMinRiskReward => _envDouble('ZONE_BOUNCE_MIN_RR', 1.2);
+  static double get zoneBounceMinRiskReward => _paramDouble(EngineIds.rangeBounce, 'min_rr', zoneBounceMinRiskRewardEnv);
+  static double get zoneBounceMinRiskRewardEnv => _envDouble('ZONE_BOUNCE_MIN_RR', 1.2);
 
   /// How many of the NEAREST zones are evaluated per cycle (2026-09-25
   /// Multi-Zone Evaluation fix). [TaEngine.findNearestZone] returns exactly
@@ -581,11 +730,119 @@ class AppConfig {
   /// one and never be looked at — observed live with a 15M Support $1.66
   /// from price losing to a 1H Support $2.33 away. This tier evaluates the
   /// top N by TRUE distance instead (see [TaEngine.findNearestZones]).
-  static int get zoneBounceEvaluatedZoneCount => _envInt('ZONE_BOUNCE_ZONE_COUNT', 3);
+  static int get zoneBounceEvaluatedZoneCount => _paramInt(EngineIds.rangeBounce, 'zone_count', zoneBounceEvaluatedZoneCountEnv);
+  static int get zoneBounceEvaluatedZoneCountEnv => _envInt('ZONE_BOUNCE_ZONE_COUNT', 3);
+
+  /// Late-session no-entry window (2026-10-07, explicit request): Range Bounce opens no trade while the
+  /// UTC hour is in [[zoneBounceBlockStartUtc], [zoneBounceBlockEndUtc]). A start at or after the end switches
+  /// the rule off, and it SHIPS OFF (24-24, 2026-10-08, explicit decision): over the full 16.09-07.10 replay it
+  /// removed 5 trades (3 winners) for -266 pips, while over 09.07-15.09 it gained +235 — no stable effect. Set
+  /// the start to 17 to block 17:00-24:00 UTC.
+  ///
+  /// Evidence, honestly: measured on its own (before Range Bounce was limited to 15M levels) that stretch lost
+  /// in both periods of ~12 weeks of real MT5 history (09.07-15.09: 34 trades, 26% wins, -722 pips; 16.09-07.10:
+  /// 22 trades, 32% wins, -215 pips). On top of the 15M-only change most of that overlap is gone, and the
+  /// window's net effect is about neutral (16.09-07.10 -327 / -452 pips, 09.07-15.09 +570 / +235 pips in the
+  /// two configs replayed): it mainly cuts exposure in the thin, news-prone hours around the New York close.
+  static int get zoneBounceBlockStartUtc => _paramInt(EngineIds.rangeBounce, 'block_start_utc', zoneBounceBlockStartUtcDefault);
+  static const int zoneBounceBlockStartUtcDefault = 24;
+  static int get zoneBounceBlockEndUtc => _paramInt(EngineIds.rangeBounce, 'block_end_utc', zoneBounceBlockEndUtcDefault);
+  static const int zoneBounceBlockEndUtcDefault = 24;
+
+  /// Hot-volatility gate (2026-10-07, explicit request): Range Bounce opens nothing while ATR(14) on 15M is
+  /// above this many times the median ATR of the last three days (see [atrHeat]) — 1.2 = 20% hotter than its
+  /// own norm. A bounce fades a move, and in a hot market the move more often keeps going; a market that is
+  /// calm or normal is where a bounce holds. 10 switches it off in practice. With too little history the
+  /// gate does nothing.
+  static double get zoneBounceMaxAtrRatio => _paramDouble(EngineIds.rangeBounce, 'max_atr_ratio', zoneBounceMaxAtrRatioDefault);
+  static const double zoneBounceMaxAtrRatioDefault = 1.2;
+
+  /// Fresh-move gate (2026-10-08, explicit request): Range Bounce will not FADE a sharp move. When price has
+  /// run more than this many ATR(14) against the trade's direction over the last two hours (8 closed 15M
+  /// candles, close to close — see [recentMoveAtr]) the bounce is skipped: a BUY after a fall, a SELL after a
+  /// rally. With too little history the gate does nothing.
+  ///
+  /// OFF BY DEFAULT (10 = off in practice, 2026-10-08, explicit decision): the idea looked right on a small sample
+  /// (fading a > 3 ATR move: 6 and 13 trades, mostly losers), but replayed through the real pipeline on top of the
+  /// other Range Bounce rules it made things WORSE in both ~12-week periods at every limit tried — recent
+  /// production-like Range Bounce +2136 pips off vs +2242 / +1829 / +2136 at 2 / 3 / 4 ATR, older +1756 off vs
+  /// +85 / +1275 / +1349 — because the hot-volatility gate already removes most of those entries and the rest were
+  /// profitable. The gate stays in the code, tested, for anyone who wants to lower the limit and turn it on.
+  static double get zoneBounceMaxFadeAtr => _paramDouble(EngineIds.rangeBounce, 'max_fade_atr', zoneBounceMaxFadeAtrDefault);
+  static const double zoneBounceMaxFadeAtrDefault = 10.0;
+
+  /// True when Range Bounce may not open a trade at [utc] because of the late-session window.
+  static bool zoneBounceBlockedAt(DateTime utc) {
+    final hour = utc.toUtc().hour;
+    return hour >= zoneBounceBlockStartUtc && hour < zoneBounceBlockEndUtc;
+  }
 
   /// Zone Bounce's own Confluence Score floor — the standard
   /// [minConfluenceScore].
   static const int minConfluenceScoreZoneBounce = minConfluenceScore;
+
+  // ---------------------------------------------------------------------
+  // Fast-Impulse Guard (market_regime_guard.dart, 2026-10-07). A mean-
+  // reversion engine fades a move, so it is exactly the engine that gets run
+  // over when a move turns out to be an impulse: after three consecutive
+  // high-momentum candles — or one shock candle larger than [impulseShockAtr]
+  // x ATR — on 15M or 5M, Range Bounce may not open a trade AGAINST that
+  // impulse for [impulseMinHours] (a run) to [impulseMaxHours] (a shock).
+  // Evaluated on closed candles only, from the candle history on every scan,
+  // so it survives a restart and replays identically in a backtest.
+  // ---------------------------------------------------------------------
+  static GuardMode get impulseGuardMode => GuardMode.parse(StrategyConfig.instance.current.filterMode(FilterIds.impulse));
+
+  static double _filterNum(String filter, String key, double fallback) =>
+      StrategyConfig.instance.current.filterNum(filter, key) ?? fallback;
+
+  /// Consecutive same-direction high-momentum candles that make an impulse.
+  static int get impulseConsecutive => _filterNum(FilterIds.impulse, 'consecutive', impulseConsecutiveDefault.toDouble()).round();
+  static const int impulseConsecutiveDefault = 3;
+
+  /// "High momentum": body / range at least this ...
+  static double get impulseMinBodyRatio => _filterNum(FilterIds.impulse, 'min_body_ratio', impulseMinBodyRatioDefault);
+  static const double impulseMinBodyRatioDefault = 0.60;
+
+  /// ... and body at least this many ATR(14).
+  static double get impulseMinBodyAtr => _filterNum(FilterIds.impulse, 'min_body_atr', impulseMinBodyAtrDefault);
+  static const double impulseMinBodyAtrDefault = 0.70;
+
+  /// A single candle whose range exceeds this many ATR(14) is a shock candle on its own.
+  static double get impulseShockAtr => _filterNum(FilterIds.impulse, 'shock_atr', impulseShockAtrDefault);
+  static const double impulseShockAtrDefault = 3.0;
+
+  /// The guard reads 5M candles as an optional extra, but only fetches them itself over the MT5 bridge (a
+  /// local call, not a metered one). IMPULSE_FORCE_M5=true makes it fetch them from any feed — for
+  /// backtests, whose bridge is deliberately disabled.
+  static bool get impulseForceM5 => _envBool('IMPULSE_FORCE_M5', false);
+
+  /// How long a momentum run / a shock candle restricts counter-trend mean-reversion entries.
+  static double get impulseMinHours => _filterNum(FilterIds.impulse, 'min_hours', impulseMinHoursDefault);
+  static const double impulseMinHoursDefault = 2.0;
+  static double get impulseMaxHours => _filterNum(FilterIds.impulse, 'max_hours', impulseMaxHoursDefault);
+  static const double impulseMaxHoursDefault = 4.0;
+
+  // ---------------------------------------------------------------------
+  // Volatility & Chaos Filter (market_regime_guard.dart, 2026-10-07). The
+  // current candle's range — and the spread, live and per bar — is compared
+  // with the MEDIAN of the same 15-minute time-of-day slot over the last
+  // [chaosBaselineDays] trading days, so a quiet Asian-session hour and the
+  // New York open are each judged against their own normal. When either is
+  // [chaosRangeMult] / [chaosSpreadMult] times that median, every engine
+  // pauses for [chaosPauseMinutes]. With no baseline (not enough history, no
+  // feed, mock data) the filter does nothing — it never blocks on a failure.
+  // ---------------------------------------------------------------------
+  static GuardMode get chaosFilterMode => GuardMode.parse(StrategyConfig.instance.current.filterMode(FilterIds.chaos));
+
+  static double get chaosRangeMult => _filterNum(FilterIds.chaos, 'range_mult', chaosRangeMultDefault);
+  static const double chaosRangeMultDefault = 3.0;
+  static double get chaosSpreadMult => _filterNum(FilterIds.chaos, 'spread_mult', chaosSpreadMultDefault);
+  static const double chaosSpreadMultDefault = 3.0;
+  static int get chaosBaselineDays => _filterNum(FilterIds.chaos, 'baseline_days', chaosBaselineDaysDefault.toDouble()).round();
+  static const int chaosBaselineDaysDefault = 20;
+  static int get chaosPauseMinutes => _filterNum(FilterIds.chaos, 'pause_minutes', chaosPauseMinutesDefault.toDouble()).round();
+  static const int chaosPauseMinutesDefault = 15;
 
   // ---------------------------------------------------------------------
   // DXY Correlation Filter (2026-09-18, explicit request) — a lightweight,
@@ -601,7 +858,18 @@ class AppConfig {
   // block, per the explicit "gracefully bypass... without stopping" spec.
   // ---------------------------------------------------------------------
 
-  static bool get useDxyFilter => (_env('USE_DXY_FILTER') ?? 'false').toLowerCase().trim() == 'true';
+  static bool get useDxyFilter => StrategyConfig.instance.current.dxyFilterEnabled ?? useDxyFilterEnv;
+  static bool get useDxyFilterEnv => (_env('USE_DXY_FILTER') ?? 'false').toLowerCase().trim() == 'true';
+
+  /// High-impact news blackout for EVERY engine (2026-10-09, explicit request: "فعّل فلتر الأخبار لكل المحركات بس
+  /// يلي عالي الخطورة"). The bridge's `filters.news` switch existed (and was on) but nothing in the app read it, so
+  /// no engine was ever held back. Now, while a high-impact USD event (CPI, NFP, FOMC, PCE... — the calendar feed is
+  /// already filtered to high impact + USD) is within [newsBlackoutMinutes] either side of now, SignalChecker opens
+  /// no new trade at all; positions already open are left alone. On by default; the feed being unavailable never
+  /// blocks (fail-open, like the DXY filter).
+  static bool get newsFilterEnabled => StrategyConfig.instance.current.newsFilterEnabled ?? _envBool('NEWS_FILTER', true);
+  static int get newsBlackoutMinutes =>
+      StrategyConfig.instance.current.newsBlackoutMinutes?.round() ?? _envInt('NEWS_BLACKOUT_MINUTES', 15);
 
   /// Manual override for the DXY ticker — set this when auto-detection
   /// (DxyFilterService querying the MT5 bridge's /symbols endpoint for
@@ -650,7 +918,10 @@ class AppConfig {
   // doubling the request volume.
   // ---------------------------------------------------------------------
 
-  static bool get useBreakoutMomentum => (_env('USE_BREAKOUT_MOMENTUM') ?? 'false').toLowerCase().trim() == 'true';
+  static bool get useBreakoutMomentum =>
+      StrategyConfig.instance.current.engineEnabled(EngineIds.breakout) ?? useBreakoutMomentumEnv;
+  static bool get useBreakoutMomentumEnv =>
+      (_env('USE_BREAKOUT_MOMENTUM') ?? 'false').toLowerCase().trim() == 'true';
 
   /// The Opening Range level source's window — deliberately a SEPARATE,
   /// independently configurable UTC time-of-day window from OrbEngine's
@@ -702,8 +973,10 @@ class AppConfig {
   /// statistically prone to a snap-back rather than genuine continuation.
   /// Floor raised 0.5 -> 0.6 on 2026-09-22 per the spec ("Body >= 0.6 x
   /// ATR(14)").
-  static double get breakoutMinBodyToAtrRatio => _envDouble('BREAKOUT_MIN_BODY_ATR', 0.6);
-  static double get breakoutMaxBodyToAtrRatio => _envDouble('BREAKOUT_MAX_BODY_ATR', 2.5);
+  static double get breakoutMinBodyToAtrRatio => _paramDouble(EngineIds.breakout, 'min_body_atr', breakoutMinBodyToAtrRatioEnv);
+  static double get breakoutMinBodyToAtrRatioEnv => _envDouble('BREAKOUT_MIN_BODY_ATR', 0.6);
+  static double get breakoutMaxBodyToAtrRatio => _paramDouble(EngineIds.breakout, 'max_body_atr', breakoutMaxBodyToAtrRatioEnv);
+  static double get breakoutMaxBodyToAtrRatioEnv => _envDouble('BREAKOUT_MAX_BODY_ATR', 2.5);
 
   /// Close-Location Wick Filter: the close must sit within this fraction
   /// of the candle's own high-low range on the breakout side — 0.70 means
@@ -711,32 +984,38 @@ class AppConfig {
   /// which is what rules out a large opposing rejection wick even when the
   /// body/ATR reading alone would qualify. Loosened 0.75 -> 0.70 on
   /// 2026-09-22 per the spec ("Close Location >= 70%").
-  static double get breakoutCloseLocationThreshold => _envDouble('BREAKOUT_CLOSE_LOCATION', 0.70);
+  static double get breakoutCloseLocationThreshold => _paramDouble(EngineIds.breakout, 'close_location', breakoutCloseLocationThresholdEnv);
+  static double get breakoutCloseLocationThresholdEnv => _envDouble('BREAKOUT_CLOSE_LOCATION', 0.70);
 
   /// Momentum Confirmation ("أريد أن أرى أن الحركة لديها قوة"): the
   /// breakout candle's range must be at least this multiple of the average
   /// range of the 14 candles before it — i.e. volatility has to EXPAND
   /// into the break, not merely continue.
-  static double get breakoutMinRangeToAvgRatio => _envDouble('BREAKOUT_MIN_RANGE_EXPANSION', 1.2);
+  static double get breakoutMinRangeToAvgRatio => _paramDouble(EngineIds.breakout, 'min_range_expansion', breakoutMinRangeToAvgRatioEnv);
+  static double get breakoutMinRangeToAvgRatioEnv => _envDouble('BREAKOUT_MIN_RANGE_EXPANSION', 1.2);
 
   // --- Spec 4: Don't chase ----------------------------------------------
 
   /// Maximum Entry Distance ("إذا اخترق السعر المستوى ثم تحرك مسافة كبيرة
   /// بالفعل، لا تطارده"): the entry candle's close must still be within
   /// this many ATR of the broken level.
-  static double get breakoutMaxEntryDistanceAtr => _envDouble('BREAKOUT_MAX_ENTRY_DISTANCE_ATR', 0.8);
+  static double get breakoutMaxEntryDistanceAtr => _paramDouble(EngineIds.breakout, 'max_entry_distance_atr', breakoutMaxEntryDistanceAtrEnv);
+  static double get breakoutMaxEntryDistanceAtrEnv => _envDouble('BREAKOUT_MAX_ENTRY_DISTANCE_ATR', 0.8);
 
   // --- Spec 5: Retest ---------------------------------------------------
 
   /// Break -> Retest -> Entry is the DEFAULT mode ("اجعل الخيار الأساسي").
   /// Set false to take the breakout candle itself.
-  static bool get breakoutRequireRetest => _envBool('BREAKOUT_REQUIRE_RETEST', true);
+  static bool get breakoutRequireRetest => _paramBool(EngineIds.breakout, 'require_retest', breakoutRequireRetestEnv);
+  static bool get breakoutRequireRetestEnv => _envBool('BREAKOUT_REQUIRE_RETEST', true);
 
   /// How many M5 candles back the retest sequence may reach for its
   /// original breakout candle, and how close price must come back to the
   /// level for that return to count as a retest of it.
-  static int get breakoutRetestLookbackCandles => _envInt('BREAKOUT_RETEST_LOOKBACK', 24);
-  static double get breakoutRetestToleranceDollars => _envDouble('BREAKOUT_RETEST_TOLERANCE_DOLLARS', 0.5);
+  static int get breakoutRetestLookbackCandles => _paramInt(EngineIds.breakout, 'retest_lookback', breakoutRetestLookbackCandlesEnv);
+  static int get breakoutRetestLookbackCandlesEnv => _envInt('BREAKOUT_RETEST_LOOKBACK', 24);
+  static double get breakoutRetestToleranceDollars => _paramDouble(EngineIds.breakout, 'retest_tolerance_dollars', breakoutRetestToleranceDollarsEnv);
+  static double get breakoutRetestToleranceDollarsEnv => _envDouble('BREAKOUT_RETEST_TOLERANCE_DOLLARS', 0.5);
 
   // --- Failed-Breakout Reversal (2026-09-22, explicit request) ----------
 
@@ -753,7 +1032,8 @@ class AppConfig {
   /// tight to survive the minimum-SL filter) — a genuine improvement, but
   /// not the "all of them" it looks like at first glance, so it stays an
   /// opt-in to test rather than an assumption.
-  static bool get breakoutFailedReversalEnabled => _envBool('BREAKOUT_FAILED_REVERSAL', false);
+  static bool get breakoutFailedReversalEnabled => _paramBool(EngineIds.breakout, 'failed_reversal', breakoutFailedReversalEnabledEnv);
+  static bool get breakoutFailedReversalEnabledEnv => _envBool('BREAKOUT_FAILED_REVERSAL', false);
 
   /// How many M5 candles after the break the failure may arrive in and
   /// still count as a trap. A break that holds for hours before giving way
@@ -827,7 +1107,8 @@ class AppConfig {
   /// DxyFilterService, and an unclear 1H swing structure returns a null
   /// bias that this tier treats as "no objection" — so a dead feed can
   /// never silently halt trading, only a genuine contradiction can.
-  static String get breakoutHtfMode => (_env('BREAKOUT_HTF_MODE') ?? 'block').toLowerCase().trim();
+  static String get breakoutHtfMode => _paramString(EngineIds.breakout, 'htf_mode', breakoutHtfModeEnv);
+  static String get breakoutHtfModeEnv => (_env('BREAKOUT_HTF_MODE') ?? 'block').toLowerCase().trim();
   static String get breakoutDxyMode => (_env('BREAKOUT_DXY_MODE') ?? 'block').toLowerCase().trim();
 
   // --- Spec 8: News filter ----------------------------------------------
@@ -846,13 +1127,18 @@ class AppConfig {
   /// volatility, not a fixed dollar distance), and the Take Profit is this
   /// R multiple of the resulting risk. 2R is only the starting point to
   /// test against 1.5R / 2.5R / 3R, not an assumption.
-  static double get breakoutSlAtrMultiplier => _envDouble('BREAKOUT_SL_ATR', 1.2);
+  static double get breakoutSlAtrMultiplier => _paramDouble(EngineIds.breakout, 'sl_atr', breakoutSlAtrMultiplierEnv);
+  static double get breakoutSlAtrMultiplierEnv => _envDouble('BREAKOUT_SL_ATR', 1.2);
   ///
   /// Defaults to the global [riskRewardRatio] (2026-09-24, explicit
   /// request: "والتيك بروفيت لكل الصفقات 1.8") rather than carrying its
   /// own separate 2.0 — every tier now targets the SAME multiple unless
   /// this is overridden in .env for a deliberate A/B test.
-  static double get breakoutTakeProfitRMultiple => _envDouble('BREAKOUT_TP_R', riskRewardRatio);
+  static double get breakoutTakeProfitRMultiple {
+    final config = StrategyConfig.instance.current;
+    return config.engineRiskReward(EngineIds.breakout) ??
+        _envDouble('BREAKOUT_TP_R', config.defaultRiskReward ?? riskRewardRatio);
+  }
 
   /// Breakout/Momentum tier's own Confluence Score floor — the standard
   /// [minConfluenceScore].
@@ -896,6 +1182,27 @@ class AppConfig {
   /// candles. Leave empty and standalone mode automatically falls back to
   /// Yahoo Finance's public chart endpoint, which needs no signup at all.
   static String get twelveDataApiKey => _env('TWELVE_DATA_API_KEY') ?? '';
+
+  /// Secrets that ship inside the app because they sit in its `.env` asset, yet
+  /// belong on the bridge (or nowhere). Anyone who can open the app package can
+  /// read them. Empty in mock/standalone mode, where the app has no bridge to
+  /// hand them to.
+  static List<String> get bundledSecretWarnings {
+    if (useMockData || disableMt5Bridge) return const [];
+    return [
+      if (anthropicApiKey.isNotEmpty)
+        'ANTHROPIC_API_KEY is bundled inside the app. Keep it only in bridge/.env — the bridge already '
+            'proxies the AI commentary.',
+      if (telegramBotToken.isNotEmpty)
+        'TELEGRAM_BOT_TOKEN is bundled inside the app. Move it (and TELEGRAM_CHAT_ID) to bridge/.env — '
+            'alerts are sent through the bridge.',
+      if (bridgeApiKey.isNotEmpty && !LocalEnv.providedKeys.contains('BRIDGE_API_KEY') && !_bridgeIsLocal)
+        'BRIDGE_API_KEY is bundled inside the app and the bridge is reachable beyond this machine. Put it in '
+            '${LocalEnv.fileName} beside the app instead, so the build itself carries no key.',
+      if (bridgeOnly && twelveDataApiKey.isNotEmpty)
+        'TWELVE_DATA_API_KEY is bundled but unused in Bridge-Only mode. Remove it from the app .env.',
+    ];
+  }
 
   /// Yahoo Finance's GC=F is COMEX gold FUTURES, typically $10-40 away from
   /// spot XAUUSD. Signals and SL/TP outcomes computed from it would not
@@ -973,6 +1280,13 @@ class AppConfig {
   /// monitoring pausing outright (no candles at all) whenever the bridge
   /// itself is down — exactly what you want when every signal/SL/TP must
   /// be computed off the SAME price your broker will actually fill you at.
+  /// True when the bridge address is this machine itself, where a leaked key is not
+  /// enough to reach it from outside.
+  static bool get _bridgeIsLocal {
+    final host = Uri.tryParse(bridgeBaseUrl)?.host ?? '';
+    return host == 'localhost' || host == '127.0.0.1' || host == '::1' || host == '[::1]' || host == '10.0.2.2';
+  }
+
   static bool get bridgeOnly => (_env('BRIDGE_ONLY') ?? 'false').toLowerCase().trim() == 'true';
 
   // ---------------------------------------------------------------------
@@ -992,12 +1306,22 @@ class AppConfig {
   /// local/virtual signal exactly like before this feature existed. Off by
   /// default — this is the one flag that turns Aureus AI from an alert
   /// system into a live auto-trader.
-  static bool get enableAutoTrading => (_env('ENABLE_AUTO_TRADING') ?? 'false').toLowerCase().trim() == 'true';
+  ///
+  /// The Strategy Control Center's mode (bridge config `mode.auto_trade`) decides: Approval or Auto turn it on,
+  /// Off turns it off. `ENABLE_AUTO_TRADING` in .env only applies when no bridge config is available.
+  static bool get enableAutoTrading {
+    final mode = StrategyConfig.instance.current.autoTradeMode;
+    return mode != null ? mode != 'off' : enableAutoTradingEnv;
+  }
+
+  static bool get enableAutoTradingEnv => (_env('ENABLE_AUTO_TRADING') ?? 'false').toLowerCase().trim() == 'true';
 
   /// Dynamic Position Sizing — hard risk cap as a percentage of live
   /// account Balance/Equity risked on a single trade's Stop Loss distance.
   /// Configurable via .env; defaults to the requested 1% max risk/trade.
-  static double get riskPercentPerTrade => double.tryParse(_env('RISK_PERCENT_PER_TRADE') ?? '') ?? 1.0;
+  static double get riskPercentPerTrade =>
+      StrategyConfig.instance.current.riskPercentPerTrade ?? riskPercentPerTradeEnv;
+  static double get riskPercentPerTradeEnv => double.tryParse(_env('RISK_PERCENT_PER_TRADE') ?? '') ?? 1.0;
 
   /// XAUUSD contract size (troy ounces per 1.0 standard lot) — combined
   /// with [TradeSetup.dollarsPerPip] ($0.10/pip) this gives the $/pip value
@@ -1024,7 +1348,8 @@ class AppConfig {
   /// getSpreadPips) is checked right before a setup is finalized/executed;
   /// exceeding this rejects the trade outright. Default matches the
   /// requested 30-pip ($3.00 on XAUUSD) ceiling.
-  static double get maxSpreadPips => double.tryParse(_env('MAX_SPREAD_PIPS') ?? '') ?? 30.0;
+  static double get maxSpreadPips => StrategyConfig.instance.current.maxSpreadPips ?? maxSpreadPipsEnv;
+  static double get maxSpreadPipsEnv => double.tryParse(_env('MAX_SPREAD_PIPS') ?? '') ?? 30.0;
 
   /// Break-Even Stop (RETIRED 2026-09-24, explicit request — "لا تحرك
   /// الستوب لنقطة الدخول ابدا يضل بمحلو يا ستوب يا هدف"). While true, a

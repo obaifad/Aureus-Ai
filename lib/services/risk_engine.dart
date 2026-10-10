@@ -4,6 +4,7 @@ import '../config/app_config.dart';
 import '../models/candle.dart';
 import '../models/pivot.dart';
 import '../models/trade_setup.dart';
+import 'strategy_config_service.dart';
 
 /// Turns a confirmed setup zone + candlestick pattern into a fully priced
 /// TradeSetup. Risk:Reward is a strict [AppConfig.riskRewardRatio] on EVERY
@@ -26,7 +27,9 @@ class RiskEngine {
     required SetupZone zone,
     required CandlePattern pattern,
     required String timeframeLabel,
+    double? riskReward,
   }) {
+    final rr = riskReward ?? AppConfig.riskRewardRatio;
     final direction = _directionFor(pattern);
     if (direction == null) return null;
 
@@ -138,8 +141,8 @@ class RiskEngine {
     // revert, and so the zone data stays truthful for anything else
     // reading it.
     final takeProfit = direction == TradeDirection.buy
-        ? entry + (AppConfig.riskRewardRatio * riskDistance)
-        : entry - (AppConfig.riskRewardRatio * riskDistance);
+        ? entry + (rr * riskDistance)
+        : entry - (rr * riskDistance);
 
     return TradeSetup(
       symbol: AppConfig.symbol,
@@ -204,6 +207,20 @@ class RiskEngine {
     final steppedLot = (rawLot / AppConfig.lotStep).floor() * AppConfig.lotStep;
     final clamped = steppedLot.clamp(AppConfig.minLotSize, AppConfig.maxLotSize);
     return double.parse(clamped.toStringAsFixed(2));
+  }
+
+  /// The lot for a new trade under the lot mode chosen on the control screen: the fixed lot in `fixed`
+  /// mode (rounded DOWN to [AppConfig.lotStep] and kept inside the allowed range, never raised), otherwise
+  /// [calculateLotSize]. The bridge makes the final decision and applies every safety limit to it.
+  double sizeLot({required double equity, required double stopLossDollars}) {
+    final config = StrategyConfig.instance.current;
+    if (config.lotMode == 'fixed') {
+      final fixed = config.fixedLotSize ?? AppConfig.minLotSize;
+      final stepped = ((fixed / AppConfig.lotStep) + 1e-9).floor() * AppConfig.lotStep;
+      final clamped = stepped.clamp(AppConfig.minLotSize, AppConfig.maxLotSize);
+      return double.parse(clamped.toStringAsFixed(2));
+    }
+    return calculateLotSize(equity: equity, stopLossDollars: stopLossDollars);
   }
 
   TradeDirection? _directionFor(CandlePattern pattern) {

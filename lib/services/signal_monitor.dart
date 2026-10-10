@@ -15,6 +15,7 @@ import 'connection_status_service.dart';
 import 'history_store.dart';
 import 'monitor_engine.dart';
 import 'monitor_task_handler.dart';
+import 'pending_store.dart';
 import 'signal_checker.dart';
 
 /// Persists whether monitoring was intentionally ON, so it auto-resumes on a
@@ -54,6 +55,7 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
   double? _liveAsk;
 
   List<TradeSetup> _history = const [];
+  List<PendingApproval> _pending = const [];
 
   bool get isRunning => _isRunning;
   bool get isChecking => _isChecking;
@@ -68,6 +70,9 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
   /// null = no tick stream (mock mode / not started yet).
   bool? get tickConnected => _tickConnected;
   List<TradeSetup> get history => List.unmodifiable(_history);
+
+  /// Proposals waiting for the owner's Telegram decision.
+  List<PendingApproval> get pending => List.unmodifiable(_pending);
 
   static bool get _useForegroundService => !kIsWeb && (Platform.isAndroid || Platform.isIOS);
 
@@ -284,6 +289,7 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<void> _reloadHistory() async {
     _history = await HistoryStore.load();
+    _pending = await PendingStore.load();
     _notify();
   }
 
@@ -303,14 +309,24 @@ class SignalMonitor extends ChangeNotifier with WidgetsBindingObserver {
   /// vs. what the counter showed" the user reported. Falls back to
   /// [livePrice] only when no tick has arrived yet (mock mode, standalone/
   /// no-bridge mode).
-  Future<void> closeTradeManually(String tradeId) async {
+  Future<ManualCloseResult?> closeTradeManually(String tradeId) async {
     final setup = _history.where((s) => s.uid == tradeId).firstOrNull;
     final tickPrice = setup == null
         ? null
         : (setup.direction == TradeDirection.buy ? _liveBid : _liveAsk);
     final price = tickPrice ?? _livePrice;
-    if (price == null) return;
-    await SignalChecker().closeTradeManually(tradeId, price);
+    if (price == null) return null;
+    final result = await SignalChecker().closeTradeManually(tradeId, price);
+    await _reloadHistory();
+    return result;
+  }
+
+  /// Wipes all persisted signal history on this device — stats reset to
+  /// zero and the "one active trade" check sees no open trade, so scanning
+  /// resumes immediately instead of waiting on a trade that no longer
+  /// matters.
+  Future<void> clearHistory() async {
+    await HistoryStore.clear();
     await _reloadHistory();
   }
 

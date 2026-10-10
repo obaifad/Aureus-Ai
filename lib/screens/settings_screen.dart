@@ -6,8 +6,11 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:provider/provider.dart';
 
 import '../config/app_config.dart';
+import '../config/local_env.dart';
 import '../services/connection_status_service.dart';
 import '../services/signal_monitor.dart';
+import '../services/strategy_config_service.dart';
+import 'strategy_control_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -64,6 +67,37 @@ class SettingsScreen extends StatelessWidget {
           ],
           const SizedBox(height: 16),
           _sectionTitle(context, 'Strategy'),
+          ListTile(
+            key: const Key('open-strategy-control'),
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.tune),
+            title: const Text('Strategy Control Center'),
+            subtitle: const Text('Engines, risk, spread and filters — edited live on the bridge'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const StrategyControlScreen()),
+            ),
+          ),
+          _infoTile(
+            'Strategy config',
+            StrategyConfig.instance.current.isEmpty
+                ? 'Local .env (bridge config unavailable)'
+                : 'Bridge · revision ${StrategyConfig.instance.current.revision}'
+                    '${StrategyConfig.instance.current.paused ? " · PAUSED" : ""}',
+          ),
+          _infoTile(
+            'Local settings file',
+            LocalEnv.loadedFrom == null
+                ? 'none (looked for ${LocalEnv.fileName} beside the app)'
+                : '${LocalEnv.loadedFrom} · ${LocalEnv.providedKeys.length} value(s)',
+          ),
+          _infoTile(
+            'Secrets bundled in the app',
+            AppConfig.bundledSecretWarnings.isEmpty
+                ? 'None ✓'
+                : '⚠ ${AppConfig.bundledSecretWarnings.length} — see System Logs (SECURITY)',
+          ),
           _infoTile('Symbol', AppConfig.symbol),
           _infoTile('Timeframes', '4H / 1H context · 15M execution (closed candles)'),
           _infoTile('Min Confluence Score', '${AppConfig.minConfluenceScore}/100'),
@@ -90,15 +124,14 @@ class SettingsScreen extends StatelessWidget {
           _infoTile('Breakout / Momentum', AppConfig.useBreakoutMomentum ? 'Enabled' : 'Disabled'),
           _infoTile('Range Bounce', AppConfig.enableRangingBounceMode ? 'Enabled' : 'Disabled'),
           const SizedBox(height: 16),
-          _sectionTitle(context, 'Opening Range Breakout'),
+          _sectionTitle(context, 'Asia Opening Range Breakout'),
           _infoTile('ORB strategy', AppConfig.useOrb ? 'Enabled' : 'Disabled'),
           if (AppConfig.useOrb) ...[
             _infoTile(
-              'Sessions',
-              [
-                if (AppConfig.orbLondonEnabled) 'London',
-                if (AppConfig.orbNewYorkEnabled) 'New York',
-              ].join(', '),
+              'Session',
+              'Asia — range ${AppConfig.orbAsiaOpenUtcHour.toString().padLeft(2, '0')}:00-'
+                  '${AppConfig.orbAsiaOpenUtcHour.toString().padLeft(2, '0')}:${AppConfig.orbRangeMinutes} UTC, '
+                  'entries until ${AppConfig.orbEntryUntilUtcHour.toString().padLeft(2, '0')}:00 UTC',
             ),
             _infoTile('Retest mode', 'Required'),
             _infoTile(
@@ -111,7 +144,7 @@ class SettingsScreen extends StatelessWidget {
               'Take Profit',
               AppConfig.orbTakeProfitPipsOverride > 0
                   ? '${AppConfig.orbTakeProfitPipsOverride.toStringAsFixed(0)} pips (fixed)'
-                  : '1 : ${AppConfig.riskRewardRatio.toStringAsFixed(1)} (standard R:R)',
+                  : '1 : ${(StrategyConfig.instance.current.engineRiskReward(EngineIds.orb) ?? AppConfig.orbRiskRewardDefault).toStringAsFixed(1)}',
             ),
           ],
           const SizedBox(height: 16),

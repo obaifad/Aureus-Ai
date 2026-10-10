@@ -42,6 +42,18 @@ class HistoryStore {
     return setups;
   }
 
+  /// Wipes the entire persisted history (all devices keep their own copy —
+  /// this only clears the local one), so stats and the "one active trade"
+  /// check both start fresh from the next signal on.
+  static Future<void> clear() => _synchronized(() async {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.remove(TradeSetup.historyPrefsKey);
+        } catch (e) {
+          AppLogger.log('HistoryStore: clear failed: $e');
+        }
+      });
+
   static Future<List<TradeSetup>> load() => _synchronized(() async {
         try {
           return await _read(await SharedPreferences.getInstance());

@@ -23,6 +23,59 @@ class PriceZone {
   const PriceZone({required this.high, required this.low, required this.direction, required this.formedIndex});
 }
 
+/// How a Liquidity-Sweep Reversal relates to the market it fires in (see [IctEngine.assessSweepAlignment]).
+enum SweepAlignmentKind {
+  /// Trades WITH a clear 4H+1H structure bias.
+  alignedWithBias,
+
+  /// No clear bias, and the sweep took the liquidity at the boundary of a real, non-trending range.
+  rangeBoundary,
+
+  /// Trades AGAINST a clear 4H+1H structure bias.
+  counterTrend,
+
+  /// No clear bias, but the sweep is not at the boundary of a real range (no range, a trending one, or
+  /// the sweep stopped short of the boundary).
+  notAtBoundary,
+}
+
+class SweepAlignment {
+  final SweepAlignmentKind kind;
+  final String detail;
+  const SweepAlignment(this.kind, this.detail);
+
+  bool get allowed => kind == SweepAlignmentKind.alignedWithBias || kind == SweepAlignmentKind.rangeBoundary;
+}
+
+/// Thresholds of the sweep realignment; the defaults and the bridge-config values live on [AppConfig].
+class SweepAlignmentParams {
+  /// 15M candles BEFORE the sweep that make up the range.
+  final int rangeLookback;
+
+  /// The range must be at least this many ATR tall.
+  final double minRangeAtr;
+
+  /// How close (ATR) the sweep's extreme must come to the range boundary — or pass beyond it.
+  final double boundaryAtr;
+
+  /// A range whose closes net/path efficiency exceeds this is a trend, not a range.
+  final double maxEfficiency;
+
+  const SweepAlignmentParams({
+    this.rangeLookback = AppConfig.ictSweepRangeLookbackDefault,
+    this.minRangeAtr = AppConfig.ictSweepMinRangeAtrDefault,
+    this.boundaryAtr = AppConfig.ictSweepBoundaryAtrDefault,
+    this.maxEfficiency = AppConfig.ictSweepMaxEfficiencyDefault,
+  });
+
+  factory SweepAlignmentParams.current() => SweepAlignmentParams(
+        rangeLookback: AppConfig.ictSweepRangeLookback,
+        minRangeAtr: AppConfig.ictSweepMinRangeAtr,
+        boundaryAtr: AppConfig.ictSweepBoundaryAtr,
+        maxEfficiency: AppConfig.ictSweepMaxEfficiency,
+      );
+}
+
 enum StructureEvent { none, bosBullish, bosBearish, chochBullish, chochBearish }
 
 /// Short display label for GoldChartScreen's structural-event tags, e.g.
@@ -357,6 +410,79 @@ class IctEngine {
     return direction == TradeDirection.buy ? bullish.contains(pattern) : bearish.contains(pattern);
   }
 
+  /// Liquidity-Sweep Reversal realignment (2026-10-07). The sweep reversal trades AGAINST the immediate
+  /// structure by design, which is exactly what made it a coin-flip inside a trend. It is now only
+  /// allowed:
+  ///
+  ///  * WITH a clear structure bias (4H and 1H agree) — [htfBias] equals [direction]; or
+  ///  * with NO clear bias, when it is a true liquidity grab at a range boundary: the 15M candles before
+  ///    the sweep form a range at least [SweepAlignmentParams.minRangeAtr] ATR tall that did not trend
+  ///    (closes' net / path efficiency <= [SweepAlignmentParams.maxEfficiency]), and the sweep's extreme
+  ///    reached — or went beyond — that range's low (buy) / high (sell) to within
+  ///    [SweepAlignmentParams.boundaryAtr] ATR.
+  ///
+  /// A reversal against a clear bias is never allowed: there is no range boundary in a trend, only a
+  /// pullback that has not finished.
+  SweepAlignment assessSweepAlignment({
+    required List<Candle> candles,
+    required TradeDirection direction,
+    required TradeDirection? htfBias,
+    SweepAlignmentParams params = const SweepAlignmentParams(),
+  }) {
+    final bullish = direction == TradeDirection.buy;
+    final side = bullish ? 'BUY' : 'SELL';
+    if (htfBias == direction) {
+      return SweepAlignment(SweepAlignmentKind.alignedWithBias, '$side sweep reversal agrees with the 4H+1H structure bias');
+    }
+    if (htfBias != null) {
+      return SweepAlignment(
+        SweepAlignmentKind.counterTrend,
+        '$side sweep reversal runs against the ${htfBias == TradeDirection.buy ? 'bullish' : 'bearish'} 4H+1H structure bias',
+      );
+    }
+
+    SweepAlignment no(String why) => SweepAlignment(SweepAlignmentKind.notAtBoundary, '$side sweep reversal is not a range-boundary grab: $why');
+
+    final sweep = _ta.findLiquiditySweep(candles, bullish: bullish);
+    final atr = _ta.averageTrueRange(candles);
+    if (sweep == null || atr == null || atr <= 0) return no('no measurable sweep / ATR');
+
+    final end = sweep.sweepIndex;
+    final start = max(0, end - params.rangeLookback);
+    if (end - start < 8) return no('not enough 15M history before the sweep');
+    final window = candles.sublist(start, end);
+    final rangeHigh = window.map((c) => c.high).reduce(max);
+    final rangeLow = window.map((c) => c.low).reduce(min);
+    final height = rangeHigh - rangeLow;
+    if (height < params.minRangeAtr * atr) {
+      return no('the ${window.length}-candle range is only ${(height / atr).toStringAsFixed(1)}×ATR tall '
+          '(needs ${params.minRangeAtr.toStringAsFixed(1)})');
+    }
+
+    var path = 0.0;
+    for (var i = 1; i < window.length; i++) {
+      path += (window[i].close - window[i - 1].close).abs();
+    }
+    final efficiency = path <= 0 ? 0.0 : (window.last.close - window.first.close).abs() / path;
+    if (efficiency > params.maxEfficiency) {
+      return no('the market trended into it (efficiency ${efficiency.toStringAsFixed(2)} > ${params.maxEfficiency.toStringAsFixed(2)})');
+    }
+
+    final tolerance = params.boundaryAtr * atr;
+    final boundary = bullish ? rangeLow : rangeHigh;
+    final reached = bullish ? sweep.sweptExtreme <= rangeLow + tolerance : sweep.sweptExtreme >= rangeHigh - tolerance;
+    if (!reached) {
+      return no('the sweep reached \$${sweep.sweptExtreme.toStringAsFixed(2)}, '
+          '\$${(sweep.sweptExtreme - boundary).abs().toStringAsFixed(2)} short of the range ${bullish ? 'low' : 'high'} '
+          '\$${boundary.toStringAsFixed(2)}');
+    }
+    return SweepAlignment(
+      SweepAlignmentKind.rangeBoundary,
+      '$side sweep reversal took the liquidity at the range ${bullish ? 'low' : 'high'} \$${boundary.toStringAsFixed(2)} '
+      '(range \$${height.toStringAsFixed(2)} = ${(height / atr).toStringAsFixed(1)}×ATR, efficiency ${efficiency.toStringAsFixed(2)})',
+    );
+  }
+
   /// The single entry point — see the class doc for the full priority
   /// order and gating rules. Tries 15M only (2026-09-14 — Scalping
   /// strategies disabled; 5M/1M were tried first before that). Returns
@@ -365,11 +491,17 @@ class IctEngine {
   /// strategies"): 15M ONLY — [candles1m]/[candles5m] were removed
   /// entirely (previously tried first, in that order, before 15M) rather
   /// than kept as unused parameters that always receive empty lists.
+  ///
+  /// [enforceSweepAlignment] (2026-10-07): when set, a Liquidity-Sweep Reversal that fails
+  /// [assessSweepAlignment] is skipped — reported to [onSweepRejected] — and the with-trend paths below
+  /// it still get their turn on the same candle. Null (the default) leaves that path exactly as it was.
   IctTriggerResult? findTrigger({
     required List<Candle> candles15m,
     required List<Candle> candles1h,
     required List<Candle> candles4h,
     required List<HtfZone> htfZones,
+    SweepAlignmentParams? enforceSweepAlignment,
+    void Function(SweepAlignment rejected)? onSweepRejected,
   }) {
     final bias4h = structureBias(candles4h);
     final bias1h = structureBias(candles1h);
@@ -385,7 +517,8 @@ class IctEngine {
       final last = candles[lastIndex];
       final pattern = _ta.classifyPattern(candles, lastIndex);
 
-      final trigger = _tryLiquiditySweepReversal(candles, lastIndex, last, pattern, htfZones, eq) ??
+      final trigger = _tryLiquiditySweepReversal(candles, lastIndex, last, pattern, htfZones, eq,
+              htfBias: htfBias, enforce: enforceSweepAlignment, onRejected: onSweepRejected) ??
           _tryZoneRetest(candles, lastIndex, last, pattern, htfBias, eq, unmitigatedOrderBlocks(candles),
               SetupType.ictOrderBlock, 'Order Block') ??
           _tryZoneRetest(candles, lastIndex, last, pattern, htfBias, eq, openFairValueGaps(candles),
@@ -407,8 +540,11 @@ class IctEngine {
     Candle last,
     CandlePattern pattern,
     List<HtfZone> htfZones,
-    double? eq,
-  ) {
+    double? eq, {
+    TradeDirection? htfBias,
+    SweepAlignmentParams? enforce,
+    void Function(SweepAlignment rejected)? onRejected,
+  }) {
     for (final bullish in [true, false]) {
       final direction = bullish ? TradeDirection.buy : TradeDirection.sell;
       if (!_confirms(pattern, direction)) continue;
@@ -432,6 +568,16 @@ class IctEngine {
           ? event == StructureEvent.chochBullish || event == StructureEvent.bosBullish
           : event == StructureEvent.chochBearish || event == StructureEvent.bosBearish;
       if (!matches) continue;
+
+      // Realignment (2026-10-07): checked last, so it only ever judges a reversal every older condition
+      // already accepted.
+      if (enforce != null) {
+        final alignment = assessSweepAlignment(candles: candles, direction: direction, htfBias: htfBias, params: enforce);
+        if (!alignment.allowed) {
+          onRejected?.call(alignment);
+          continue;
+        }
+      }
 
       return ExecutionTrigger(
         type: SetupType.ictLiquiditySweepReversal,

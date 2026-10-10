@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import '../models/pivot.dart';
 import '../models/trade_setup.dart';
 import '../services/signal_monitor.dart';
+import '../utils/trade_time_format.dart';
 
 class SignalCard extends StatelessWidget {
   final TradeSetup setup;
@@ -78,12 +78,31 @@ class SignalCard extends StatelessWidget {
                         );
                       }),
                     ),
-                  Text(
-                    DateFormat('HH:mm').format(setup.detectedAt.toLocal()),
-                    style: Theme.of(context).textTheme.bodySmall,
+                  Flexible(
+                    child: Text(
+                      TradeTimeFormat.header(setup.detectedAt),
+                      style: Theme.of(context).textTheme.bodySmall,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
                   ),
                 ],
               ),
+              if (setup.isMissed) ...[
+                const SizedBox(height: 8),
+                Container(
+                  key: const Key('not-traded-chip'),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: Colors.blueGrey.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '📭 Not traded — ${setup.notTradedLabel}',
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
               const SizedBox(height: 12),
               Row(
                 children: [
@@ -92,7 +111,10 @@ class SignalCard extends StatelessWidget {
                     value: setup.effectiveEntry.toStringAsFixed(2),
                   ),
                   const SizedBox(width: 8),
-                  _StatChip(label: setup.breakEvenActive ? 'SL (BE)' : 'SL', value: setup.activeStopLoss.toStringAsFixed(2), color: Colors.red),
+                  _StatChip(
+                      label: setup.breakEvenActive ? 'SL (BE)' : 'SL',
+                      value: setup.activeStopLoss.toStringAsFixed(2),
+                      color: Colors.red),
                   const SizedBox(width: 8),
                   _StatChip(label: 'TP', value: setup.takeProfit.toStringAsFixed(2), color: Colors.green),
                 ],
@@ -121,7 +143,7 @@ class SignalCard extends StatelessWidget {
                 _OutcomeResultPanel(setup: setup),
               ] else ...[
                 const SizedBox(height: 10),
-                _LivePipCounter(setup: setup),
+                _LivePipCounter(setup: setup, hypothetical: setup.isMissed),
                 if (onCloseTrade != null) ...[
                   const SizedBox(height: 10),
                   SizedBox(
@@ -194,7 +216,10 @@ class _StatChip extends StatelessWidget {
 /// counter still shows SOMETHING rather than staying blank indefinitely.
 class _LivePipCounter extends StatelessWidget {
   final TradeSetup setup;
-  const _LivePipCounter({required this.setup});
+
+  /// True for a signal nobody traded: the pips shown are what it WOULD be doing, not a real position's.
+  final bool hypothetical;
+  const _LivePipCounter({required this.setup, this.hypothetical = false});
 
   @override
   Widget build(BuildContext context) {
@@ -219,8 +244,7 @@ class _LivePipCounter extends StatelessWidget {
         final currentPrice = setup.direction == TradeDirection.buy ? bid : ask;
         // effectiveEntry — the broker's real fill once known, not the
         // theoretical signal price (see TradeSetup.actualFillPrice).
-        final delta =
-            setup.direction == TradeDirection.buy ? bid - setup.effectiveEntry : setup.effectiveEntry - ask;
+        final delta = setup.direction == TradeDirection.buy ? bid - setup.effectiveEntry : setup.effectiveEntry - ask;
         final pips = delta / TradeSetup.dollarsPerPip;
         final color = pips >= 0 ? Colors.green : Colors.red;
         final pipsText = '${pips >= 0 ? "+" : ""}${pips.toStringAsFixed(1)} pips';
@@ -253,7 +277,7 @@ class _LivePipCounter extends StatelessWidget {
                 ],
               ),
               Text(
-                'Live \$${currentPrice.toStringAsFixed(2)}',
+                '${hypothetical ? "If taken · " : ""}Live \$${currentPrice.toStringAsFixed(2)}',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
@@ -308,9 +332,20 @@ class _OutcomeResultPanel extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            'Exit ${setup.closedPrice!.toStringAsFixed(2)} · ${DateFormat('MMM d, HH:mm').format(setup.closedAt!.toLocal())}',
+            'Exit ${setup.closedPrice!.toStringAsFixed(2)} · ${TradeTimeFormat.exitStamp(setup.closedAt!)}',
             style: Theme.of(context).textTheme.bodySmall,
           ),
+          if (setup.brokerProfitLabel != null || setup.closeReasonLabel != null) ...[
+            const SizedBox(height: 2),
+            Text(
+              key: const Key('broker-result'),
+              [
+                if (setup.brokerProfitLabel != null) 'MT5 net ${setup.brokerProfitLabel}',
+                if (setup.closeReasonLabel != null) setup.closeReasonLabel!,
+              ].join(' · '),
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+            ),
+          ],
         ],
       ),
     );

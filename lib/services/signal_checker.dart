@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'dart:math';
 import '../config/app_config.dart';
 import '../models/candle.dart';
@@ -9,9 +10,14 @@ import 'connection_status_service.dart';
 import 'data_service.dart';
 import 'history_store.dart';
 import 'breakout_momentum_engine.dart';
+import 'approval_service.dart';
+import 'broker_reconciler.dart';
 import 'dxy_filter_service.dart';
+import 'pending_store.dart';
+import 'strategy_config_service.dart';
 import 'ict_engine.dart';
 import 'impulse_correction_engine.dart';
+import 'market_regime_guard.dart';
 import 'mt5_trading_service.dart';
 import 'news_calendar_service.dart';
 import 'notifier_service.dart';
@@ -26,6 +32,17 @@ class _CachedCandles {
   final List<Candle> candles;
   final FeedSource? source; // null in mock mode
   const _CachedCandles(this.fetchedAt, this.candles, this.source);
+}
+
+/// The market-dynamics safety layers' verdicts for one scan, each with the mode it runs in.
+class _Regime {
+  final GuardMode impulseMode;
+  final ImpulseVerdict impulse;
+  final GuardMode chaosMode;
+  final ChaosVerdict chaos;
+  const _Regime({required this.impulseMode, required this.impulse, required this.chaosMode, required this.chaos});
+
+  bool get chaosActive => chaosMode != GuardMode.off && chaos.stressed;
 }
 
 /// [isFresh] is false when these candles came from the cache after a failed
@@ -136,6 +153,8 @@ class SignalChecker {
   final OrbEngine _orb = OrbEngine();
   final ZoneBounceEngine _zoneBounce = ZoneBounceEngine();
   final BreakoutMomentumEngine _breakout = BreakoutMomentumEngine();
+  final ImpulseDetector _impulse = const ImpulseDetector();
+  final ChaosDetector _chaos = const ChaosDetector();
   final RiskEngine _risk;
 
   /// Injectable clock and data source (2026-09-25) — both default to the
@@ -147,16 +166,30 @@ class SignalChecker {
   final DateTime Function() _now;
   final DataService Function() _newDataService;
 
-  SignalChecker({DataService Function()? dataServiceFactory, DateTime Function()? clock})
-      : _now = clock ?? DateTime.now,
+  SignalChecker({
+    DataService Function()? dataServiceFactory,
+    DateTime Function()? clock,
+    Mt5TradingService? trading,
+  })  : _now = clock ?? DateTime.now,
         _newDataService = dataServiceFactory ?? DataService.new,
-        _risk = RiskEngine(clock: clock);
+        _risk = RiskEngine(clock: clock),
+        _trading = trading ?? Mt5TradingService();
   final AiEngine _ai = AiEngine();
   final NotifierService _notifier = NotifierService();
   final PriceAlertService _alerts = PriceAlertService();
   final NewsCalendarService _newsCalendar = NewsCalendarService();
   final DxyFilterService _dxy = DxyFilterService();
-  final Mt5TradingService _trading = Mt5TradingService();
+  final Mt5TradingService _trading;
+  late final BrokerReconciler _reconciler = BrokerReconciler(trading: _trading, clock: _now);
+  late final ApprovalService _approval = ApprovalService(trading: _trading, clock: _now);
+
+  /// Engine debounce state as it was BEFORE a proposal fired, kept per proposal so a
+  /// rejected / expired / blocked one can hand its engine back exactly as it was.
+  final Map<String, Map<String, Object?>> _pendingPreState = {};
+
+  /// An engine whose proposal was not traded stays quiet until this time, so the
+  /// very same still-valid setup cannot re-propose itself on the next scan.
+  final Map<String, DateTime> _engineCooldownUntil = {};
 
   // 15M is the only timeframe that ever fires now (2026-09-14 — was 5M
   // before Scalping strategies were disabled), so a single "last signaled
@@ -225,6 +258,19 @@ class SignalChecker {
   DateTime? _lastZoneBounceSignalDirectionTime;
   final Map<String, DateTime> _lastZoneBounceZoneSignalTime = {};
 
+  // Volatility & Chaos Filter baseline (market_regime_guard.dart, 2026-10-07): what each 15-minute slot
+  // of the day normally looks like over the last ~20 trading days. It changes slowly, so it is rebuilt at
+  // most once an hour from ONE long history fetch (the bridge's 2000-candle cap is ~21 trading days of
+  // 15M). After a failed fetch the stale baseline is kept (better than none) and the next attempt waits.
+  VolatilityBaseline? _volatilityBaseline;
+  DateTime? _baselineRetryAfter;
+  static const Duration _baselineTtl = Duration(minutes: 60);
+  static const Duration _baselineRetryDelay = Duration(minutes: 10);
+  static const int _baselineCandleCount = 2000;
+
+  /// Guard messages already logged (a verdict that holds for many 30-second scans is logged once).
+  final Set<String> _loggedGuardKeys = {};
+
   // Per-timeframe candle cache — persists across check() cycles (this
   // instance lives for the whole monitoring session). An entry is reused
   // only while BOTH its TTL hasn't expired AND no candle boundary of that
@@ -242,10 +288,346 @@ class SignalChecker {
     240: Duration(minutes: 60),
   };
 
+  /// Which engines were enabled last scan — used to drop an engine's
+  /// debounce state the moment it is switched off.
+  final Map<String, bool> _engineWasEnabled = {};
+
+  bool _engineEnabled(String id) => switch (id) {
+        EngineIds.htfRetest => AppConfig.useHtfRetest,
+        EngineIds.ict => AppConfig.useIct,
+        EngineIds.ici => AppConfig.useIci,
+        EngineIds.orb => AppConfig.useOrb,
+        EngineIds.breakout => AppConfig.useBreakoutMomentum,
+        EngineIds.rangeBounce => AppConfig.enableRangingBounceMode,
+        _ => true,
+      };
+
+  /// Called once per scan after the config snapshot is promoted. A disabled
+  /// engine is never evaluated, so it cannot burn a cooldown; this also
+  /// clears the cooldowns it already held when it is switched OFF. ORB is
+  /// deliberately left alone: its "one trade per range per day" is a
+  /// strategy rule, not an in-flight debounce.
+  void _syncEngineStates() {
+    for (final id in EngineIds.all) {
+      final enabled = _engineEnabled(id);
+      if (_engineWasEnabled[id] == true && !enabled) {
+        _resetEngineState(id);
+        _log('Engine $id switched OFF — its cooldown state was cleared');
+      }
+      _engineWasEnabled[id] = enabled;
+    }
+  }
+
+  void _resetEngineState(String id) {
+    switch (id) {
+      case EngineIds.htfRetest:
+        _lastSignalCandleTime = null;
+        _lastSignalDirection = null;
+        _lastSignalDirectionTime = null;
+        _lastZoneSignalTime.clear();
+      case EngineIds.ict:
+        _lastIctSignalCandleTime = null;
+        _lastIctSignalDirection = null;
+        _lastIctSignalDirectionTime = null;
+        _lastIctZoneSignalTime.clear();
+      case EngineIds.ici:
+        _lastIciSignalCandleTime = null;
+        _lastIciSignalDirection = null;
+        _lastIciSignalDirectionTime = null;
+        _lastIciZoneSignalTime.clear();
+      case EngineIds.breakout:
+        _lastBreakoutSignalCandleTime = null;
+        _lastBreakoutSignalDirection = null;
+        _lastBreakoutSignalDirectionTime = null;
+        _lastBreakoutZoneSignalTime.clear();
+      case EngineIds.rangeBounce:
+        _lastZoneBounceSignalCandleTime = null;
+        _lastZoneBounceSignalDirection = null;
+        _lastZoneBounceSignalDirectionTime = null;
+        _lastZoneBounceZoneSignalTime.clear();
+    }
+  }
+
+  bool _cooling(String id) {
+    final until = _engineCooldownUntil[id];
+    if (until == null) return false;
+    if (!_now().isBefore(until)) {
+      _engineCooldownUntil.remove(id);
+      return false;
+    }
+    return true;
+  }
+
+  /// An engine runs only if it is switched on AND not cooling down after a
+  /// proposal that was not traded.
+  bool _runnable(String id, bool enabled) => enabled && !_cooling(id);
+
+  void _coolEngine(String id, Duration duration) => _engineCooldownUntil[id] = _now().add(duration);
+
+  /// A copy of an engine's debounce state (what it remembers having signalled).
+  Map<String, Object?> _captureEngineState(String id) => switch (id) {
+        EngineIds.htfRetest => {
+            'candle': _lastSignalCandleTime,
+            'dir': _lastSignalDirection,
+            'dirTime': _lastSignalDirectionTime,
+            'zones': Map<String, DateTime>.of(_lastZoneSignalTime),
+          },
+        EngineIds.ict => {
+            'candle': _lastIctSignalCandleTime,
+            'dir': _lastIctSignalDirection,
+            'dirTime': _lastIctSignalDirectionTime,
+            'zones': Map<String, DateTime>.of(_lastIctZoneSignalTime),
+          },
+        EngineIds.ici => {
+            'candle': _lastIciSignalCandleTime,
+            'dir': _lastIciSignalDirection,
+            'dirTime': _lastIciSignalDirectionTime,
+            'zones': Map<String, DateTime>.of(_lastIciZoneSignalTime),
+          },
+        EngineIds.breakout => {
+            'candle': _lastBreakoutSignalCandleTime,
+            'dir': _lastBreakoutSignalDirection,
+            'dirTime': _lastBreakoutSignalDirectionTime,
+            'zones': Map<String, DateTime>.of(_lastBreakoutZoneSignalTime),
+          },
+        EngineIds.rangeBounce => {
+            'candle': _lastZoneBounceSignalCandleTime,
+            'dir': _lastZoneBounceSignalDirection,
+            'dirTime': _lastZoneBounceSignalDirectionTime,
+            'zones': Map<String, DateTime>.of(_lastZoneBounceZoneSignalTime),
+          },
+        EngineIds.orb => {'consumed': Set<String>.of(_consumedOrbRanges)},
+        _ => const <String, Object?>{},
+      };
+
+  /// Puts an engine's debounce state back to [state]. Used when a signal the
+  /// engine fired turned out not to be proposed or traded, so the engine does
+  /// not stay "used up" for something the owner never got to decide on.
+  void _restoreEngineState(String id, Map<String, Object?> state) {
+    if (state.isEmpty) return;
+    DateTime? candle() => state['candle'] as DateTime?;
+    TradeDirection? dir() => state['dir'] as TradeDirection?;
+    DateTime? dirTime() => state['dirTime'] as DateTime?;
+    Map<String, DateTime> zones() => state['zones'] as Map<String, DateTime>;
+    switch (id) {
+      case EngineIds.htfRetest:
+        _lastSignalCandleTime = candle();
+        _lastSignalDirection = dir();
+        _lastSignalDirectionTime = dirTime();
+        _lastZoneSignalTime
+          ..clear()
+          ..addAll(zones());
+      case EngineIds.ict:
+        _lastIctSignalCandleTime = candle();
+        _lastIctSignalDirection = dir();
+        _lastIctSignalDirectionTime = dirTime();
+        _lastIctZoneSignalTime
+          ..clear()
+          ..addAll(zones());
+      case EngineIds.ici:
+        _lastIciSignalCandleTime = candle();
+        _lastIciSignalDirection = dir();
+        _lastIciSignalDirectionTime = dirTime();
+        _lastIciZoneSignalTime
+          ..clear()
+          ..addAll(zones());
+      case EngineIds.breakout:
+        _lastBreakoutSignalCandleTime = candle();
+        _lastBreakoutSignalDirection = dir();
+        _lastBreakoutSignalDirectionTime = dirTime();
+        _lastBreakoutZoneSignalTime
+          ..clear()
+          ..addAll(zones());
+      case EngineIds.rangeBounce:
+        _lastZoneBounceSignalCandleTime = candle();
+        _lastZoneBounceSignalDirection = dir();
+        _lastZoneBounceSignalDirectionTime = dirTime();
+        _lastZoneBounceZoneSignalTime
+          ..clear()
+          ..addAll(zones());
+      case EngineIds.orb:
+        _consumedOrbRanges
+          ..clear()
+          ..addAll(state['consumed'] as Set<String>);
+    }
+  }
+
+  /// A proposal ended without a trade: hand its engine back and keep it quiet for a while.
+  void _releaseApproval(ReleasedApproval released, StrategyConfigSnapshot cfg) {
+    final id = released.approval.engineId;
+    final snapshot = _pendingPreState.remove(released.approval.uid);
+    if (snapshot != null) _restoreEngineState(id, snapshot);
+    final decided = released.state == 'rejected' || released.state == 'expired';
+    final cooldown = decided ? Duration(minutes: cfg.rejectCooldownMinutes) : const Duration(minutes: 2);
+    _coolEngine(id, cooldown);
+    _log('📲 Proposal ${released.approval.setup.setupLabel} ended: ${released.state} — $id released, '
+        'quiet for ${cooldown.inMinutes} min');
+  }
+
+  @visibleForTesting
+  int debugPriorityRank(TradeSetup setup) => _enginePriorityRank(setup);
+
+  /// The two evaluators the market-safety layers live in, callable with hand-built candles (the full
+  /// scan needs a whole multi-timeframe market to make either engine fire).
+  @visibleForTesting
+  Future<TradeSetup?> debugEvaluateZoneBounce({
+    required List<Candle> m15,
+    required List<HtfZone> htfZones,
+    required List<String> notes,
+    required double livePrice,
+    ImpulseVerdict impulse = ImpulseVerdict.none,
+    GuardMode impulseMode = GuardMode.off,
+  }) =>
+      _evaluateZoneBounceTrigger(
+        m15: m15,
+        htfZones: htfZones,
+        htfStructureBias: null,
+        notes: notes,
+        livePrice: livePrice,
+        impulse: impulse,
+        impulseMode: impulseMode,
+      );
+
+  @visibleForTesting
+  Future<TradeSetup?> debugEvaluateIct({
+    required List<Candle> m15,
+    required List<Candle> h1,
+    required List<Candle> h4,
+    required List<HtfZone> htfZones,
+    required List<String> notes,
+    required double livePrice,
+  }) =>
+      _evaluateIctTrigger(m15: m15, h1: h1, h4: h4, htfZones: htfZones, notes: notes, livePrice: livePrice);
+
+  @visibleForTesting
+  Future<TradeSetup?> debugEvaluateOrb({
+    required List<Candle> candles5m,
+    required TradeDirection? bias1h,
+    required DateTime nowUtc,
+    required List<String> notes,
+    required double livePrice,
+  }) =>
+      _evaluateOrbTrigger(candles5m: candles5m, bias1h: bias1h, nowUtc: nowUtc, notes: notes, livePrice: livePrice);
+
+  @visibleForTesting
+  Map<String, Object?> debugCaptureState(String id) => _captureEngineState(id);
+
+  @visibleForTesting
+  void debugRestoreState(String id, Map<String, Object?> state) => _restoreEngineState(id, state);
+
+  @visibleForTesting
+  bool debugCooling(String id) => _cooling(id);
+
+  @visibleForTesting
+  void debugCool(String id, Duration duration) => _coolEngine(id, duration);
+
+  /// Marks [id] as having just fired, the way a real signal would.
+  @visibleForTesting
+  void debugMarkFired(String id) {
+    final now = _now();
+    switch (id) {
+      case EngineIds.htfRetest:
+        _lastSignalCandleTime = now;
+        _lastSignalDirection = TradeDirection.buy;
+        _lastSignalDirectionTime = now;
+        _lastZoneSignalTime['zone'] = now;
+      case EngineIds.rangeBounce:
+        _lastZoneBounceSignalCandleTime = now;
+        _lastZoneBounceSignalDirection = TradeDirection.sell;
+        _lastZoneBounceSignalDirectionTime = now;
+        _lastZoneBounceZoneSignalTime['zone'] = now;
+      case EngineIds.orb:
+        _consumedOrbRanges.add('london|fired');
+    }
+  }
+
   /// Prints the reasoning behind every accept/reject decision this cycle
   /// makes, routed through AppLogger (persisted, visible in System Logs from
   /// either isolate, and in `adb logcat`).
   void _log(String message) => AppLogger.log(message);
+
+  /// Logs [message] the first time [key] is seen. A guard verdict that holds across many 30-second scans
+  /// (the same candle, the same impulse) is one event, not one line per scan.
+  void _logGuardOnce(String key, String message) {
+    if (_loggedGuardKeys.length > 400) _loggedGuardKeys.clear();
+    if (_loggedGuardKeys.add(key)) _log(message);
+  }
+
+  /// The 20-day time-of-day volatility baseline, rebuilt at most once an hour. Null when none could be
+  /// built — the Chaos Filter then has no opinion (it never blocks on a failure).
+  Future<VolatilityBaseline?> _loadVolatilityBaseline(DataService dataService, DateTime nowUtc, int days) async {
+    final cached = _volatilityBaseline;
+    if (cached != null && cached.days == days && nowUtc.difference(cached.builtAt) < _baselineTtl) return cached;
+    final retryAfter = _baselineRetryAfter;
+    if (retryAfter != null && nowUtc.isBefore(retryAfter)) return cached;
+    try {
+      final history = await dataService.getCandles(timeframeMinutes: AppConfig.tfM15, count: _baselineCandleCount);
+      final closed = closedCandlesOnly(history, AppConfig.tfM15, nowUtc);
+      if (closed.length < 200) {
+        _baselineRetryAfter = nowUtc.add(_baselineRetryDelay);
+        _log('Volatility baseline: only ${closed.length} closed 15M candles available — chaos filter has no opinion');
+        return cached;
+      }
+      final built = VolatilityBaseline.build(closed, nowUtc: nowUtc, days: days);
+      _volatilityBaseline = built;
+      _baselineRetryAfter = null;
+      _log('Volatility baseline built from ${closed.length} closed 15M candles (median per time-of-day slot, '
+          'last $days trading days)');
+      return built;
+    } catch (e) {
+      _baselineRetryAfter = nowUtc.add(_baselineRetryDelay);
+      _log('Volatility baseline unavailable ($e) — ${cached == null ? 'chaos filter has no opinion' : 'keeping the previous one'}');
+      return cached;
+    }
+  }
+
+  /// Evaluates the Fast-Impulse Guard and the Chaos Filter for this scan. Each is only evaluated when
+  /// its mode is not `off`; the impulse guard only when Range Bounce — the one engine it restricts — is
+  /// enabled. Any failure degrades to "no opinion": a safety layer must not be able to break the scan.
+  Future<_Regime> _assessRegime({
+    required DataService dataService,
+    required List<Candle> m15,
+    required List<Candle> m15Raw,
+    required List<Candle> m5,
+    required DateTime nowUtc,
+    required bool bridgeLive,
+  }) async {
+    final impulseMode = AppConfig.impulseGuardMode;
+    final chaosMode = AppConfig.chaosFilterMode;
+
+    var impulse = ImpulseVerdict.none;
+    if (impulseMode != GuardMode.off && AppConfig.enableRangingBounceMode) {
+      try {
+        impulse = _impulse.assess(m15: m15, m5: m5, nowUtc: nowUtc, params: ImpulseParams.current());
+      } catch (e) {
+        _log('Fast-Impulse Guard skipped this scan: $e');
+      }
+    }
+
+    var chaos = ChaosVerdict.unavailable;
+    if (chaosMode != GuardMode.off && !AppConfig.useMockData) {
+      try {
+        final params = ChaosParams.current();
+        final baseline = await _loadVolatilityBaseline(dataService, nowUtc, params.baselineDays);
+        final liveSpread = bridgeLive ? await _trading.getSpreadPips() : null;
+        final newest = m15Raw.isEmpty ? null : m15Raw.last;
+        final forming = newest != null && newest.time.toUtc().add(const Duration(minutes: AppConfig.tfM15)).isAfter(nowUtc)
+            ? newest
+            : null;
+        chaos = _chaos.assess(
+          closed15m: m15,
+          forming: forming,
+          baseline: baseline,
+          nowUtc: nowUtc,
+          liveSpreadPips: liveSpread,
+          params: params,
+        );
+      } catch (e) {
+        _log('Chaos filter skipped this scan: $e');
+      }
+    }
+    return _Regime(impulseMode: impulseMode, impulse: impulse, chaosMode: chaosMode, chaos: chaos);
+  }
 
   /// Minimum Take-Profit Distance Filter (2026-09-14, explicit request;
   /// threshold documented on AppConfig.minTakeProfitPips) — shared by all
@@ -316,7 +698,16 @@ class SignalChecker {
   /// tier's candle/zone/directional cooldown for an opportunity that never
   /// actually fired. See DxyFilterService's own doc comment for why every
   /// failure mode there resolves to allow, never to block.
-  Future<bool> _passesDxyFilter(TradeSetup setup, String triggerInfo, List<String> notes) async {
+  Future<bool> _passesDxyFilter(
+    TradeSetup setup,
+    String triggerInfo,
+    List<String> notes,
+    String engineId,
+  ) async {
+    // Per-engine override from the bridge config: `off`/`exempt` skip the
+    // filter for this engine only. Null (no config) keeps today's behaviour.
+    final engineMode = StrategyConfig.instance.current.engineDxyMode(engineId);
+    if (engineMode == 'off' || engineMode == 'exempt') return true;
     final confirmed = await _dxy.confirms(setup.direction);
     if (!confirmed) {
       notes.add('$triggerInfo | rejected: DXY Correlation Filter — DXY is currently '
@@ -329,26 +720,30 @@ class SignalChecker {
 
   /// Engine Priority Resolution (2026-09-20, explicit request): when more
   /// than one of the 5 engines fires in the same cycle, only the setup from
-  /// the highest-ranked engine here survives — lower index wins. Fixed
-  /// hierarchy per the request: Top-Down > ICT > ORB (Retest) > ICI >
-  /// Breakout/Momentum — deliberately NOT alphabetical/declaration order
-  /// (ORB outranks ICI here even though ICI is the older strategy).
+  /// the highest-ranked engine here survives — lower index wins. Built-in
+  /// hierarchy (used when the bridge config has no priorities; it matches the
+  /// bridge default): Top-Down > ICT > ICI > Range Bounce > ORB > Breakout —
+  /// deliberately NOT alphabetical/declaration order.
   static const List<StrategyFamily> _enginePriorityOrder = [
     StrategyFamily.topDown,
     StrategyFamily.ict,
-    StrategyFamily.orb,
     StrategyFamily.ici,
-    StrategyFamily.breakout,
-    // Ranging Market Module, last (2026-09-25). It can only fire while
-    // there is NO clear HTF bias, which is precisely when the five
-    // trend-following engines above are least likely to have fired at all,
-    // so this ranking rarely decides anything — but it must be PRESENT:
-    // _enginePriorityRank uses indexOf, and a family missing from this list
-    // would rank -1 and silently outrank every other engine.
+    // Ranging Market Module. It can only fire while there is NO clear HTF bias, when the
+    // trend engines are least likely to have fired. Every family MUST be present:
+    // _enginePriorityRank uses indexOf, and a family missing from this list would rank
+    // -1 and silently outrank every other engine.
     StrategyFamily.rangingBounce,
+    StrategyFamily.orb,
+    StrategyFamily.breakout,
   ];
 
-  int _enginePriorityRank(TradeSetup setup) => _enginePriorityOrder.indexOf(setup.setupType.strategyFamily);
+  /// Rank of a setup's engine when several fire at once (lower wins). Follows the
+  /// priorities in the bridge config when present, else the built-in order.
+  int _enginePriorityRank(TradeSetup setup) {
+    final family = setup.setupType.strategyFamily;
+    return StrategyConfig.instance.current.enginePriority(EngineIds.forFamily(family)) ??
+        _enginePriorityOrder.indexOf(family) + 1;
+  }
 
   /// Logs which zone is currently closest when no legacy trigger formed.
   void _logNoTrigger(double livePrice, List<HtfZone> htfZones) {
@@ -470,13 +865,30 @@ class SignalChecker {
   /// through SL/TP is caught intrabar, cycles that were skipped (app killed,
   /// Doze) don't lose the candles in between, and a wick from BEFORE the
   /// trade existed can never close it.
-  Future<bool> _resolveOpenTrades(List<Candle> m15Raw) => _sweepOpenTrades(
-      (setup) => setup.evaluateOutcomeOverCandles(m15Raw, updateBreakEven: AppConfig.breakEvenEnabled));
+  Future<bool> _resolveOpenTrades(List<Candle> m15Raw) => _sweepOpenTrades((setup) => _brokerOwns(setup)
+      ? null
+      : setup.evaluateOutcomeOverCandles(m15Raw, updateBreakEven: AppConfig.breakEvenEnabled));
+
+  /// With reconciliation on, a trade backed by a REAL position is closed by
+  /// the broker's record (see BrokerReconciler), not by this price estimate.
+  bool _brokerOwns(TradeSetup setup) => setup.brokerTicket != null && AppConfig.reconcileWithBroker;
+
+  /// Reconciles the trade log with MT5 and sends the usual outcome
+  /// notification for every trade the broker closed.
+  Future<ReconcileResult> reconcile() async {
+    final result = await _reconciler.reconcile();
+    for (final setup in result.newlyClosed) {
+      await _notifier.sendOutcome(setup);
+    }
+    return result;
+  }
 
   /// Sub-second fast path — called by MonitorEngine on every bridge tick. A
   /// BUY closes on the bid, a SELL on the ask.
-  Future<bool> resolveOpenTradesAtTick({required double bid, required double ask}) => _sweepOpenTrades(
-      (setup) => setup.evaluateOutcomeAtTick(bid: bid, ask: ask, updateBreakEven: AppConfig.breakEvenEnabled));
+  Future<bool> resolveOpenTradesAtTick({required double bid, required double ask}) =>
+      _sweepOpenTrades((setup) => _brokerOwns(setup)
+          ? null
+          : setup.evaluateOutcomeAtTick(bid: bid, ask: ask, updateBreakEven: AppConfig.breakEvenEnabled));
 
   /// Manual Close (2026-09-17, explicit request): closes the OPEN trade
   /// identified by [tradeId] (TradeSetup.uid) at [currentPrice] — pips are
@@ -484,25 +896,68 @@ class SignalChecker {
   /// persisted as [TradeOutcome.manualClose] rather than win/loss. Returns
   /// true if a matching open trade was found and closed, false otherwise
   /// (already closed / unknown id).
-  Future<bool> closeTradeManually(String tradeId, double currentPrice) async {
+  Future<ManualCloseResult> closeTradeManually(String tradeId, double currentPrice) async {
+    final open = (await HistoryStore.load())
+        .where((s) => s.uid == tradeId && s.outcome == TradeOutcome.open && !s.isMissed)
+        .toList();
+    if (open.isEmpty) {
+      _log('Manual Close requested for unknown/already-closed trade id: $tradeId');
+      return const ManualCloseResult(closed: false, message: 'This trade is already closed.');
+    }
+
+    // A trade backed by a REAL MT5 position must be closed there first:
+    // marking it closed locally while the position stays open would leave
+    // real exposure that the app no longer tracks or protects.
+    var price = currentPrice;
+    var brokerClosed = false;
+    var note = '';
+    final ticket = open.first.brokerTicket;
+    if (ticket != null) {
+      final outcome = await _trading.closePosition(ticket);
+      if (outcome.success) {
+        brokerClosed = true;
+        price = outcome.price ?? currentPrice;
+      } else if (outcome.notFound) {
+        _log('Manual Close: MT5 position #$ticket no longer exists — recording the close locally');
+        note = ' (the MT5 position was already closed)';
+      } else {
+        _log('Manual Close FAILED for MT5 position #$ticket: ${outcome.error}');
+        return ManualCloseResult(
+          closed: false,
+          message: 'Could not close the MT5 position #$ticket: ${outcome.error}. '
+              'The trade is still open — try again or close it in MetaTrader.',
+        );
+      }
+    }
+
     TradeSetup? closedSetup;
     await HistoryStore.mutate((history) {
       for (final setup in history) {
         if (setup.uid != tradeId) continue;
-        if (setup.closeTradeManually(currentPrice)) closedSetup = setup;
+        if (setup.closeTradeManually(price)) closedSetup = setup;
         break;
       }
       return closedSetup != null;
     });
     if (closedSetup == null) {
-      _log('Manual Close requested for unknown/already-closed trade id: $tradeId');
-      return false;
+      // The sweep closed it locally between the load above and now.
+      _log('Manual Close: trade $tradeId was already closed by the outcome sweep');
+      return ManualCloseResult(
+        closed: brokerClosed,
+        brokerClosed: brokerClosed,
+        message: brokerClosed ? 'Closed on MT5.' : 'This trade is already closed.',
+      );
     }
     final setup = closedSetup!;
     _log('✋ Manually Closed — ${setup.setupLabel} closed @ \$${setup.closedPrice!.toStringAsFixed(2)} '
         '(${setup.pips! >= 0 ? "+" : ""}${setup.pips!.toStringAsFixed(1)} pips)');
     await _notifier.sendOutcome(setup);
-    return true;
+    return ManualCloseResult(
+      closed: true,
+      brokerClosed: brokerClosed,
+      message: 'Closed at \$${price.toStringAsFixed(2)}'
+          '${brokerClosed ? ' — the MT5 position was closed' : (ticket == null ? ' (signal only, no MT5 position)' : '')}$note.',
+    );
   }
 
   bool _cacheValid(int timeframeMinutes, _CachedCandles cached, DateTime now) {
@@ -554,6 +1009,12 @@ class SignalChecker {
     final notes = <String>[];
     _log('--- scan cycle start ---');
 
+    // Strategy config (bridge-owned): fetch, then promote exactly once so
+    // this whole scan sees ONE consistent configuration.
+    await StrategyConfig.instance.refresh();
+    final cfg = StrategyConfig.instance.beginCycle();
+    _syncEngineStates();
+
     // Economic Calendar — 15-Minute Advance Notification.
     try {
       final dueNews = await _newsCalendar.dueForAdvanceNotice();
@@ -579,7 +1040,25 @@ class SignalChecker {
     // comfortably covers a session's Opening Range plus the rest of that
     // day's trading, and far more than ATR(14) needs for Breakout/Momentum.
     final needsM5 = AppConfig.useOrb || AppConfig.useBreakoutMomentum;
-    final m5Fetch = needsM5 ? await _getCandles(dataService, AppConfig.tfM5, 200) : null;
+    final bridgeLive = !AppConfig.useMockData && !AppConfig.disableMt5Bridge;
+    // The Fast-Impulse Guard (2026-10-07) also reads 5M, but only as an OPTIONAL extra: it is fetched for
+    // it only when Range Bounce — the engine it restricts — is on, the guard is not off and the MT5 bridge
+    // is the feed (a local call, not a metered one; IMPULSE_FORCE_M5 overrides that for backtests), and a
+    // failed fetch just leaves the guard on 15M.
+    final impulseWantsM5 = !needsM5 &&
+        (bridgeLive || (AppConfig.impulseForceM5 && !AppConfig.useMockData)) &&
+        AppConfig.enableRangingBounceMode &&
+        AppConfig.impulseGuardMode != GuardMode.off;
+    _CandleFetch? m5Fetch;
+    if (needsM5) {
+      m5Fetch = await _getCandles(dataService, AppConfig.tfM5, 200);
+    } else if (impulseWantsM5) {
+      try {
+        m5Fetch = await _getCandles(dataService, AppConfig.tfM5, 200);
+      } catch (e) {
+        _log('Fast-Impulse Guard: 5M candles unavailable ($e) — using 15M only this scan');
+      }
+    }
 
     final nowUtc = _now().toUtc();
     final h4 = closedCandlesOnly(h4Fetch.candles, AppConfig.tfH4, nowUtc);
@@ -659,21 +1138,147 @@ class SignalChecker {
     // Trade Outcome Watcher.
     await _resolveOpenTrades(m15Raw);
 
-    // One Active Trade Limit (2026-09-17, explicit request): while any
-    // trade is still open, no new signal is generated at all — strategy
-    // evaluation is skipped entirely until the current trade closes
-    // (win, loss, or manual close).
-    final openTrades = (await HistoryStore.load()).where((s) => s.outcome == TradeOutcome.open).toList();
-    if (AppConfig.oneActiveTradeLimit && openTrades.isNotEmpty) {
-      final open = openTrades.first;
-      notes.add('$feedLabel | One Active Trade Limit: ${open.setupLabel} @ ${open.entry} still open — '
-          'new signal generation paused until it closes');
-      _log('One Active Trade Limit: ${open.setupLabel} @ ${open.entry} still open — skipping signal generation this cycle');
+    // Broker truth for real positions: closes, corrected fills, orphans.
+    final reconciled = await reconcile();
+    if (reconciled.changedAnything) _log('🔄 Reconcile: ${reconciled.summary}');
+    if (reconciled.hasWarnings) notes.add('Reconcile: ${reconciled.summary}');
+
+    // Trade approval: learn what became of proposals waiting on the owner. Runs
+    // BEFORE anything can return early, so an approved trade is imported even
+    // while trading is paused, and BEFORE the next reconcile could mistake its
+    // position for an unknown one.
+    final approvals = await _approval.sync();
+    for (final trade in approvals.executed) {
+      _pendingPreState.remove(trade.uid);
+      _log('✅ Approved trade is live on MT5 — ${trade.setupLabel} #${trade.brokerTicket} '
+          '@ \$${trade.effectiveEntry.toStringAsFixed(2)} ${trade.lotSize ?? ""} lots');
+      await _notifier.sendSignal(trade, telegram: false);
+    }
+    for (final released in approvals.released) {
+      _releaseApproval(released, cfg);
+    }
+
+    // Account-level daily loss lock (enforced by the bridge, which also refuses
+    // the orders): no point generating signals that cannot be traded today.
+    final risk = await _trading.getRiskStatus();
+    if (risk != null && risk.locked) {
+      final lost = risk.lockedLossPercent ?? risk.lossPercent;
+      notes.add('$feedLabel | Daily loss limit reached'
+          '${lost == null ? "" : " (-${lost.toStringAsFixed(2)}% of ${risk.limitPercent.toStringAsFixed(1)}%)"}'
+          ' — no new signals until 00:00 UTC');
+      _log('Daily loss lock active — skipping signal generation this cycle');
       return SignalCheckResult(
         status: 'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
         feed: feed,
         livePrice: livePrice,
       );
+    }
+
+    // Bridge-wide pause (/pause, mode.paused): open trades keep being tracked
+    // above, but nothing new is generated — no phantom signals either.
+    if (cfg.paused) {
+      notes.add('$feedLabel | Paused by the bridge config (mode.paused) — no new signals');
+      _log('Paused by the bridge config — skipping signal generation this cycle');
+      return SignalCheckResult(
+        status: 'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+        feed: feed,
+        livePrice: livePrice,
+      );
+    }
+
+    // One Active Trade Limit (2026-09-17, explicit request): while any
+    // trade is still open, no new signal is generated at all — strategy
+    // evaluation is skipped entirely until the current trade closes
+    // (win, loss, or manual close).
+    final history = await HistoryStore.load();
+    // A signal nobody traded (expired / rejected approval) is tracked for the record but is not a trade: it must
+    // never hold back the next signal.
+    final openTrades = history.where((s) => s.outcome == TradeOutcome.open && !s.isMissed).toList();
+    if (AppConfig.oneActiveTradeLimit && openTrades.isNotEmpty) {
+      final open = openTrades.first;
+      notes.add('$feedLabel | One Active Trade Limit: ${open.setupLabel} @ ${open.entry} still open — '
+          'new signal generation paused until it closes');
+      _log(
+          'One Active Trade Limit: ${open.setupLabel} @ ${open.entry} still open — skipping signal generation this cycle');
+      return SignalCheckResult(
+        status: 'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+        feed: feed,
+        livePrice: livePrice,
+      );
+    }
+
+    final waiting = await PendingStore.load();
+    if (waiting.isNotEmpty) {
+      final p = waiting.first;
+      final until = p.expiresAt.toLocal();
+      final hh = until.hour.toString().padLeft(2, '0');
+      final mm = until.minute.toString().padLeft(2, '0');
+      final ss = until.second.toString().padLeft(2, '0');
+      notes.add('$feedLabel | Awaiting your Telegram approval: ${p.setup.setupLabel} @ ${p.setup.entry} '
+          '(decide before $hh:$mm:$ss)');
+      return SignalCheckResult(
+        status: 'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+        feed: feed,
+        livePrice: livePrice,
+      );
+    }
+
+    final lossStreak = _todayLossStreak(history, nowUtc);
+    if (AppConfig.dailyLossStreakLimit > 0 && lossStreak >= AppConfig.dailyLossStreakLimit) {
+      notes.add('$feedLabel | Daily Loss Circuit Breaker: $lossStreak consecutive losses today — '
+          'new signal generation paused until 00:00 UTC');
+      _log('Daily Loss Circuit Breaker: $lossStreak consecutive losses today — skipping signal generation this cycle');
+      return SignalCheckResult(
+        status: 'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+        feed: feed,
+        livePrice: livePrice,
+      );
+    }
+
+    // Market-dynamics safety layers (2026-10-07). The Chaos Filter is the one cross-engine layer: in BLOCK
+    // mode a stressed market pauses every engine for this scan, before any of them can burn a debounce; in
+    // SHADOW mode the scan goes on and whatever fires is tagged with what the filter would have done.
+    final regime = await _assessRegime(
+      dataService: dataService,
+      m15: m15,
+      m15Raw: m15Raw,
+      m5: m5,
+      nowUtc: nowUtc,
+      bridgeLive: bridgeLive,
+    );
+    if (regime.chaosActive) {
+      final why = regime.chaos.reason;
+      if (regime.chaosMode == GuardMode.block) {
+        notes.add('$feedLabel | Chaos filter: $why — all engines paused');
+        _logGuardOnce('chaos-block|${regime.chaos.episodeKey}', '⏸ Chaos filter PAUSE — all engines: $why');
+        return SignalCheckResult(
+          status: 'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+          feed: feed,
+          livePrice: livePrice,
+        );
+      }
+      _logGuardOnce('chaos-shadow|${regime.chaos.episodeKey}', '🕶️ [SHADOW] Chaos filter would have paused all engines: $why');
+    }
+
+    // High-impact news blackout for EVERY engine (2026-10-09, explicit request). The bridge's `filters.news` switch
+    // existed but was never read here, so only the (disabled) Breakout tier ever honoured it. Now no engine opens a
+    // trade while a high-impact USD release is within [AppConfig.newsBlackoutMinutes] either side of now; positions
+    // already open are untouched. The calendar being unavailable never blocks (see NewsCalendarService).
+    if (AppConfig.newsFilterEnabled && AppConfig.newsBlackoutMinutes > 0) {
+      final window = AppConfig.newsBlackoutMinutes;
+      final event = await _newsCalendar.blackoutEvent(Duration(minutes: window), now: nowUtc);
+      if (event != null) {
+        final at = formatUtcHm(event.timeUtc);
+        notes.add('$feedLabel | News blackout: ${event.name} at $at UTC (high-impact USD) — no new entries '
+            'within $window min of the release');
+        _logGuardOnce('news|${event.name}@${event.timeUtc.toIso8601String()}',
+            '📰 News blackout — ${event.name} at $at UTC: no engine opens a trade within $window min of it');
+        return SignalCheckResult(
+          status: 'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+          feed: feed,
+          livePrice: livePrice,
+        );
+      }
     }
 
     final htfZones = _ta.buildHtfZones(candles15m: m15, candles1h: h1, candles4h: h4);
@@ -686,6 +1291,11 @@ class SignalChecker {
     // (below) never reads a zone at all, so an empty zone pool must NOT
     // skip it too; the final `setups.isEmpty` check further down is what
     // actually decides whether this cycle produces "No new signal".
+    final enginesOff = EngineIds.all.where((id) => !_engineEnabled(id)).toList();
+    if (enginesOff.isNotEmpty) notes.add('Engines OFF: ${enginesOff.join(", ")}');
+    final cooling = EngineIds.all.where(_cooling).toList();
+    if (cooling.isNotEmpty) notes.add('Engines quiet after a decision: ${cooling.join(", ")}');
+    final preFireState = {for (final id in EngineIds.all) id: _captureEngineState(id)};
     TradeSetup? legacySetup;
     TradeSetup? ictSetup;
     TradeSetup? iciSetup;
@@ -696,38 +1306,50 @@ class SignalChecker {
     } else {
       // Three of the four INDEPENDENT strategies (ORB is evaluated
       // separately below), each with its own debounce state.
-      legacySetup = await _evaluateLegacyTrigger(
-        m15: m15,
-        htfZones: htfZones,
-        bias: bias,
-        hourlyBias: hourlyBias,
-        htfStructureBias: htfStructureBias,
-        baseInfo: baseInfo,
-        notes: notes,
-        livePrice: livePrice,
-      );
-      ictSetup = await _evaluateIctTrigger(
-        m15: m15,
-        h1: h1,
-        h4: h4,
-        htfZones: htfZones,
-        notes: notes,
-        livePrice: livePrice,
-      );
-      iciSetup = await _evaluateIciTrigger(
-        m15: m15,
-        h1: h1,
-        h4: h4,
-        htfZones: htfZones,
-        notes: notes,
-        livePrice: livePrice,
-      );
+      legacySetup = !_runnable(EngineIds.htfRetest, AppConfig.useHtfRetest)
+          ? null
+          : await _evaluateLegacyTrigger(
+              m15: m15,
+              htfZones: htfZones,
+              bias: bias,
+              hourlyBias: hourlyBias,
+              htfStructureBias: htfStructureBias,
+              baseInfo: baseInfo,
+              notes: notes,
+              livePrice: livePrice,
+            );
+      ictSetup = !_runnable(EngineIds.ict, AppConfig.useIct)
+          ? null
+          : await _evaluateIctTrigger(
+              m15: m15,
+              h1: h1,
+              h4: h4,
+              htfZones: htfZones,
+              notes: notes,
+              livePrice: livePrice,
+            );
+      iciSetup = !_runnable(EngineIds.ici, AppConfig.useIci)
+          ? null
+          : await _evaluateIciTrigger(
+              m15: m15,
+              h1: h1,
+              h4: h4,
+              htfZones: htfZones,
+              notes: notes,
+              livePrice: livePrice,
+            );
     }
 
-    // A FOURTH, fully independent strategy tier (2026-09-18) — never reads
-    // htfZones, an HTF bias, or any candlestick pattern; see orb_engine.dart.
-    final orbSetup = AppConfig.useOrb
-        ? await _evaluateOrbTrigger(candles5m: m5, nowUtc: nowUtc, notes: notes, livePrice: livePrice)
+    // The Asia ORB tier (rebuilt 2026-10-09 as the fifth engine) — never reads htfZones, any candlestick pattern
+    // or a trend gate; see orb_engine.dart. The 1H bias only colours its (informational) Confluence Score.
+    final orbSetup = _runnable(EngineIds.orb, AppConfig.useOrb)
+        ? await _evaluateOrbTrigger(
+            candles5m: m5,
+            bias1h: hourlyBias,
+            nowUtc: nowUtc,
+            notes: notes,
+            livePrice: livePrice,
+          )
         : null;
 
     // A FIFTH, fully independent strategy tier (2026-09-18, rebuilt
@@ -735,7 +1357,7 @@ class SignalChecker {
     // (Previous Day, session, swing and Opening Range levels don't need
     // them), so it still runs with an empty zone pool; see
     // breakout_momentum_engine.dart.
-    final breakoutSetup = AppConfig.useBreakoutMomentum
+    final breakoutSetup = _runnable(EngineIds.breakout, AppConfig.useBreakoutMomentum)
         ? await _evaluateBreakoutTrigger(
             candles5m: m5,
             candles15m: m15,
@@ -753,13 +1375,15 @@ class SignalChecker {
     // rather than competing: it covers exactly the market state they are
     // built to stand down in. Needs htfZones, so it sits inside the same
     // guard the zone-reading tiers do.
-    final zoneBounceSetup = AppConfig.enableRangingBounceMode && htfZones.isNotEmpty
+    final zoneBounceSetup = _runnable(EngineIds.rangeBounce, AppConfig.enableRangingBounceMode) && htfZones.isNotEmpty
         ? await _evaluateZoneBounceTrigger(
             m15: m15,
             htfZones: htfZones,
             htfStructureBias: htfStructureBias,
             notes: notes,
             livePrice: livePrice,
+            impulse: regime.impulse,
+            impulseMode: regime.impulseMode,
           )
         : null;
 
@@ -793,6 +1417,11 @@ class SignalChecker {
       notes.add('🏆 Engine Priority Resolution: kept ${kept.setupLabel} (${kept.setupType.strategyFamily.label}) '
           '— dropped $droppedLabel');
       setups = [kept];
+      // The dropped engines already marked themselves as having signalled; they never did.
+      for (final loser in dropped) {
+        final id = EngineIds.forFamily(loser.setupType.strategyFamily);
+        _restoreEngineState(id, preFireState[id]!);
+      }
     }
 
     if (setups.isEmpty) {
@@ -805,10 +1434,14 @@ class SignalChecker {
 
     for (final setup in setups) {
       setup.dataSource = feedLabel;
+      setup.configRevision = cfg.isEmpty ? null : cfg.revision;
+      // SHADOW: the Chaos Filter would have paused this scan (BLOCK returned above, so only shadow gets here).
+      if (regime.chaosActive) setup.addShadowFlag('${ShadowLayer.chaos}: ${regime.chaos.reason}');
     }
 
     final liveTradingReady = !AppConfig.useMockData && !AppConfig.disableMt5Bridge;
     final winner = setups.single;
+    final winnerId = EngineIds.forFamily(winner.setupType.strategyFamily);
 
     // Single Active Position Guard (2026-09-20, explicit request): a REAL
     // broker check, on top of (not instead of) the local "One Active Trade
@@ -822,6 +1455,7 @@ class SignalChecker {
       final openPositions = await _trading.getOpenPositions();
       if (openPositions.isNotEmpty) {
         const message = 'Signal skipped: Active XAUUSD position already open.';
+        _restoreEngineState(winnerId, preFireState[winnerId]!); // nothing was proposed
         _log(message);
         notes.add(message);
         return SignalCheckResult(
@@ -837,9 +1471,12 @@ class SignalChecker {
     // appear and vanish within seconds.
     if (liveTradingReady) {
       final spreadPips = await _trading.getSpreadPips();
-      if (spreadPips != null && spreadPips > AppConfig.maxSpreadPips) {
+      final spreadCap =
+          cfg.engineMaxSpreadPips(EngineIds.forFamily(winner.setupType.strategyFamily)) ?? AppConfig.maxSpreadPips;
+      if (spreadPips != null && spreadPips > spreadCap) {
         final message = 'Signal rejected: Live spread (${spreadPips.toStringAsFixed(1)} pips) exceeds maximum '
-            'allowed (${AppConfig.maxSpreadPips.toStringAsFixed(0)} pips).';
+            'allowed (${spreadCap.toStringAsFixed(0)} pips).';
+        _restoreEngineState(winnerId, preFireState[winnerId]!); // nothing was proposed
         _log(message);
         notes.add(message);
         return SignalCheckResult(
@@ -860,16 +1497,47 @@ class SignalChecker {
         _log('Auto-Trading: account snapshot unavailable or trading not allowed on the broker side — '
             '${winner.setupLabel} stays a signal-only alert, no order sent.');
       } else {
-        final lot = _risk.calculateLotSize(equity: account.equity, stopLossDollars: winner.riskDollars);
+        final lot = _risk.sizeLot(equity: account.equity, stopLossDollars: winner.riskDollars);
         winner.lotSize = lot;
+        if (cfg.autoTradeMode == 'approval') {
+          // Nothing is traded here. The bridge asks the owner on Telegram, then
+          // re-checks price, lot and every limit at the moment of approval.
+          final proposal = await _approval.submit(winner, winnerId);
+          if (proposal.isPending) {
+            _pendingPreState[winner.uid] = preFireState[winnerId]!;
+            notes.add('📲 ${winner.setupLabel} @ ${winner.entry} sent to Telegram for approval');
+            return SignalCheckResult(
+              status:
+                  'Awaiting approval — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+              feed: feed,
+              livePrice: livePrice,
+            );
+          }
+          _restoreEngineState(winnerId, preFireState[winnerId]!);
+          _coolEngine(winnerId, const Duration(minutes: 2));
+          final why = proposal.reason == null ? proposal.state : '${proposal.state}: ${proposal.reason}';
+          _log('📲 ${winner.setupLabel} was not proposed for approval ($why)');
+          notes.add('Signal not proposed for approval ($why)');
+          return SignalCheckResult(
+            status:
+                'No new signal — ${notes.join(" | ")} (4H context: ${h4.length} candles, bias: ${_biasLabel(bias)})',
+            feed: feed,
+            livePrice: livePrice,
+          );
+        }
         final order = await _trading.openMarketOrder(
           direction: winner.direction,
           volume: lot,
           stopLoss: winner.stopLoss,
           takeProfit: winner.takeProfit,
+          // The bridge re-checks that price has not run away from this entry, and sizes the lot itself in
+          // the account's own currency ([lot] above is only an estimate that ignores the currency).
+          entry: winner.entry,
+          bridgeSizing: true,
         );
         if (order.success) {
           winner.brokerTicket = order.ticket;
+          winner.lotSize = order.volume ?? lot;
           // The REAL fill price (2026-09-21, explicit fix): a market order
           // can slip a little from the theoretical [entry] priced off the
           // confirmation candle's close — every later money calculation
@@ -877,8 +1545,8 @@ class SignalChecker {
           // what the broker actually did (see TradeSetup.effectiveEntry).
           winner.actualFillPrice = order.price;
           _log('🏦 Auto-Trading — ${winner.directionLabel} order #${order.ticket} opened @ '
-              '\$${order.price?.toStringAsFixed(2)} for $lot lots (Risk ${AppConfig.riskPercentPerTrade.toStringAsFixed(1)}% '
-              'of \$${account.equity.toStringAsFixed(2)} equity)');
+              '\$${order.price?.toStringAsFixed(2)} for ${order.volume ?? lot} lots ('
+              '${cfg.lotMode == 'fixed' ? 'fixed lot' : 'Risk ${AppConfig.riskPercentPerTrade.toStringAsFixed(1)}% of \$${account.equity.toStringAsFixed(2)} equity'})');
         } else {
           _log('⚠️ Auto-Trading — broker rejected the ${winner.directionLabel} order: ${order.error}. '
               '${winner.setupLabel} still recorded as a signal-only alert.');
@@ -886,8 +1554,7 @@ class SignalChecker {
       }
     }
 
-    final summary =
-        setups.map((s) => '${s.setupLabel} @ ${s.entry} (Score ${s.confluenceScore}/100)').join(' | ');
+    final summary = setups.map((s) => '${s.setupLabel} @ ${s.entry} (Score ${s.confluenceScore}/100)').join(' | ');
     return SignalCheckResult(
       status: '${setups.length} new signal${setups.length > 1 ? "s" : ""}: $summary',
       setups: setups,
@@ -973,6 +1640,7 @@ class SignalChecker {
       zone: zone,
       pattern: trigger.pattern,
       timeframeLabel: triggerTimeframeLabel,
+      riskReward: AppConfig.rrFor(EngineIds.htfRetest),
     );
     if (setup == null) {
       notes.add('$baseInfo | $triggerInfo | Setup rejected: invalid risk distance (Entry == Stop Loss)');
@@ -986,17 +1654,20 @@ class SignalChecker {
     }
 
     if (_rejectsMinTakeProfitDistance(setup)) {
-      notes.add('$baseInfo | $triggerInfo | Setup rejected: TP distance below ${AppConfig.minTakeProfitPips.toStringAsFixed(0)} pips minimum');
+      notes.add(
+          '$baseInfo | $triggerInfo | Setup rejected: TP distance below ${AppConfig.minTakeProfitPips.toStringAsFixed(0)} pips minimum');
       return null;
     }
 
     if (_rejectsMinStopLossDistance(setup)) {
-      notes.add('$baseInfo | $triggerInfo | Setup rejected: SL distance below ${AppConfig.minStopLossPips.toStringAsFixed(0)} pips minimum');
+      notes.add(
+          '$baseInfo | $triggerInfo | Setup rejected: SL distance below ${AppConfig.minStopLossPips.toStringAsFixed(0)} pips minimum');
       return null;
     }
 
     if (_rejectsMaxStopLossDistance(setup)) {
-      notes.add('$baseInfo | $triggerInfo | Setup rejected: SL distance above ${AppConfig.maxStopLossPips.toStringAsFixed(0)} pips maximum');
+      notes.add(
+          '$baseInfo | $triggerInfo | Setup rejected: SL distance above ${AppConfig.maxStopLossPips.toStringAsFixed(0)} pips maximum');
       return null;
     }
 
@@ -1132,7 +1803,7 @@ class SignalChecker {
       return null;
     }
 
-    if (!await _passesDxyFilter(setup, '$baseInfo | $triggerInfo', notes)) return null;
+    if (!await _passesDxyFilter(setup, '$baseInfo | $triggerInfo', notes, EngineIds.htfRetest)) return null;
 
     // All rules passed — fire.
     _lastSignalCandleTime = candleTime;
@@ -1168,7 +1839,23 @@ class SignalChecker {
     required List<String> notes,
     required double livePrice,
   }) async {
-    final found = _ict.findTrigger(candles15m: m15, candles1h: h1, candles4h: h4, htfZones: htfZones);
+    // Liquidity-Sweep Reversal realignment (2026-10-07): in BLOCK mode the engine itself skips a sweep
+    // reversal that is neither with the 4H+1H bias nor a range-boundary grab, so the with-trend ICT paths
+    // still get their turn on the same candle; in SHADOW mode it is judged after the fact (below).
+    final sweepMode = AppConfig.ictSweepMode;
+    final sweepParams = SweepAlignmentParams.current();
+    final found = _ict.findTrigger(
+      candles15m: m15,
+      candles1h: h1,
+      candles4h: h4,
+      htfZones: htfZones,
+      enforceSweepAlignment: sweepMode == GuardMode.block ? sweepParams : null,
+      onSweepRejected: (rejected) {
+        notes.add('[ICT] Liquidity-Sweep Reversal rejected: ${rejected.detail}');
+        _logGuardOnce('ict-sweep|${m15.last.time.toUtc().toIso8601String()}|${rejected.kind.name}',
+            '⛔ [ICT] Liquidity-Sweep Reversal rejected by the alignment rule: ${rejected.detail}');
+      },
+    );
     if (found == null) {
       notes.add('[ICT] No Order Block / FVG / Breaker / Liquidity Sweep / Trendline trigger this cycle');
       return null;
@@ -1199,6 +1886,7 @@ class SignalChecker {
       zone: zone,
       pattern: trigger.pattern,
       timeframeLabel: triggerTimeframeLabel,
+      riskReward: AppConfig.rrFor(EngineIds.ict),
     );
     if (setup == null) {
       notes.add('[ICT] $triggerInfo | rejected: invalid risk distance (Entry == Stop Loss)');
@@ -1211,17 +1899,20 @@ class SignalChecker {
     }
 
     if (_rejectsMinTakeProfitDistance(setup)) {
-      notes.add('[ICT] $triggerInfo | rejected: TP distance below ${AppConfig.minTakeProfitPips.toStringAsFixed(0)} pips minimum');
+      notes.add(
+          '[ICT] $triggerInfo | rejected: TP distance below ${AppConfig.minTakeProfitPips.toStringAsFixed(0)} pips minimum');
       return null;
     }
 
     if (_rejectsMinStopLossDistance(setup)) {
-      notes.add('[ICT] $triggerInfo | rejected: SL distance below ${AppConfig.minStopLossPips.toStringAsFixed(0)} pips minimum');
+      notes.add(
+          '[ICT] $triggerInfo | rejected: SL distance below ${AppConfig.minStopLossPips.toStringAsFixed(0)} pips minimum');
       return null;
     }
 
     if (_rejectsMaxStopLossDistance(setup)) {
-      notes.add('[ICT] $triggerInfo | rejected: SL distance above ${AppConfig.maxStopLossPips.toStringAsFixed(0)} pips maximum');
+      notes.add(
+          '[ICT] $triggerInfo | rejected: SL distance above ${AppConfig.maxStopLossPips.toStringAsFixed(0)} pips maximum');
       return null;
     }
 
@@ -1265,7 +1956,22 @@ class SignalChecker {
       return null;
     }
 
-    if (!await _passesDxyFilter(setup, '[ICT] $triggerInfo', notes)) return null;
+    if (!await _passesDxyFilter(setup, '[ICT] $triggerInfo', notes, EngineIds.ict)) return null;
+
+    // SHADOW verdict of the sweep realignment: recorded only for a setup that really fires.
+    if (sweepMode == GuardMode.shadow && trigger.type == SetupType.ictLiquiditySweepReversal) {
+      final alignment = _ict.assessSweepAlignment(
+        candles: triggerCandles,
+        direction: setup.direction,
+        htfBias: htfBias,
+        params: sweepParams,
+      );
+      if (!alignment.allowed) {
+        setup.addShadowFlag('${ShadowLayer.ictSweep}: ${alignment.detail}');
+        _logGuardOnce('ict-sweep-shadow|${candleTime.toUtc().toIso8601String()}|${setup.direction.name}',
+            '🕶️ [SHADOW] [ICT] Liquidity-Sweep Reversal would have been rejected by the alignment rule: ${alignment.detail}');
+      }
+    }
 
     _lastIctSignalCandleTime = candleTime;
     _lastIctSignalDirection = setup.direction;
@@ -1307,7 +2013,7 @@ class SignalChecker {
       CandlePattern.doji || CandlePattern.none => 0,
     };
 
-    if (setup.riskRewardRatio >= AppConfig.riskRewardRatio) score += 25;
+    if (setup.riskRewardRatio >= AppConfig.rrFor(EngineIds.ict)) score += 25;
 
     final confirmation = triggerCandles.last;
     final bodyRatio = confirmation.range > 0 ? confirmation.bodySize / confirmation.range : 0.0;
@@ -1363,6 +2069,7 @@ class SignalChecker {
       zone: zone,
       pattern: trigger.pattern,
       timeframeLabel: triggerTimeframeLabel,
+      riskReward: AppConfig.rrFor(EngineIds.ici),
     );
     if (setup == null) {
       notes.add('[ICI] $triggerInfo | rejected: invalid risk distance (Entry == Stop Loss)');
@@ -1402,8 +2109,8 @@ class SignalChecker {
       final widenedRisk = finalSlPips * TradeSetup.dollarsPerPip;
       final newStopLoss = setup.direction == TradeDirection.buy ? setup.entry - widenedRisk : setup.entry + widenedRisk;
       final newTakeProfit = setup.direction == TradeDirection.buy
-          ? setup.entry + AppConfig.riskRewardRatio * widenedRisk
-          : setup.entry - AppConfig.riskRewardRatio * widenedRisk;
+          ? setup.entry + AppConfig.rrFor(EngineIds.ici) * widenedRisk
+          : setup.entry - AppConfig.rrFor(EngineIds.ici) * widenedRisk;
       _log('[ICI] SL widened ${structureSlPips.toStringAsFixed(1)} -> ${finalSlPips.toStringAsFixed(1)} pips '
           '(ATR(14) ${atr == null ? "n/a" : "\$${atr.toStringAsFixed(2)} -> ${atrSlPips.toStringAsFixed(1)}p"}, '
           'floor ${AppConfig.iciMinStopLossPips.toStringAsFixed(0)}p)');
@@ -1427,17 +2134,20 @@ class SignalChecker {
     }
 
     if (_rejectsMinTakeProfitDistance(setup)) {
-      notes.add('[ICI] $triggerInfo | rejected: TP distance below ${AppConfig.minTakeProfitPips.toStringAsFixed(0)} pips minimum');
+      notes.add(
+          '[ICI] $triggerInfo | rejected: TP distance below ${AppConfig.minTakeProfitPips.toStringAsFixed(0)} pips minimum');
       return null;
     }
 
     if (_rejectsMinStopLossDistance(setup)) {
-      notes.add('[ICI] $triggerInfo | rejected: SL distance below ${AppConfig.minStopLossPips.toStringAsFixed(0)} pips minimum');
+      notes.add(
+          '[ICI] $triggerInfo | rejected: SL distance below ${AppConfig.minStopLossPips.toStringAsFixed(0)} pips minimum');
       return null;
     }
 
     if (_rejectsMaxStopLossDistance(setup)) {
-      notes.add('[ICI] $triggerInfo | rejected: SL distance above ${AppConfig.maxStopLossPips.toStringAsFixed(0)} pips maximum');
+      notes.add(
+          '[ICI] $triggerInfo | rejected: SL distance above ${AppConfig.maxStopLossPips.toStringAsFixed(0)} pips maximum');
       return null;
     }
 
@@ -1462,7 +2172,8 @@ class SignalChecker {
     final score = _iciConfluenceScore(setup, trigger.zone.source);
     setup.confluenceScore = score;
     if (score < AppConfig.minConfluenceScoreIci) {
-      notes.add('[ICI] $triggerInfo | Confluence Score $score/100 — rejected (< ${AppConfig.minConfluenceScoreIci} required)');
+      notes.add(
+          '[ICI] $triggerInfo | Confluence Score $score/100 — rejected (< ${AppConfig.minConfluenceScoreIci} required)');
       return null;
     }
 
@@ -1475,7 +2186,7 @@ class SignalChecker {
       return null;
     }
 
-    if (!await _passesDxyFilter(setup, '[ICI] $triggerInfo', notes)) return null;
+    if (!await _passesDxyFilter(setup, '[ICI] $triggerInfo', notes, EngineIds.ici)) return null;
 
     _lastIciSignalCandleTime = candleTime;
     _lastIciSignalDirection = setup.direction;
@@ -1510,7 +2221,7 @@ class SignalChecker {
       CandlePattern.doji || CandlePattern.none => 0,
     };
 
-    if (setup.riskRewardRatio >= AppConfig.riskRewardRatio) score += 25;
+    if (setup.riskRewardRatio >= AppConfig.rrFor(EngineIds.ici)) score += 25;
 
     final signalCount = ' + '.allMatches(zoneSource).length + 1;
     score += signalCount >= 2 ? 25 : 15;
@@ -1542,21 +2253,68 @@ class SignalChecker {
     required TradeDirection? htfStructureBias,
     required List<String> notes,
     required double livePrice,
+    ImpulseVerdict impulse = ImpulseVerdict.none,
+    GuardMode impulseMode = GuardMode.off,
   }) async {
     if (htfStructureBias != null) {
       notes.add('[Range] Clear HTF bias (${htfStructureBias.name}) — ranging module stands down');
       return null;
     }
 
+    // Late-session no-entry window (2026-10-07, explicit request) — checked before any work is done, and
+    // before this engine can touch its debounce state, so a blocked scan leaves nothing consumed.
+    if (AppConfig.zoneBounceBlockedAt(_now())) {
+      notes.add('[Range] No entries ${AppConfig.zoneBounceBlockStartUtc.toString().padLeft(2, '0')}:00-'
+          '${AppConfig.zoneBounceBlockEndUtc.toString().padLeft(2, '0')}:00 UTC (late session) — Range Bounce is paused');
+      return null;
+    }
+
+    // 100% focus on 15M levels (2026-10-07, explicit request): Range Bounce only bounces off 15M levels.
+    // Every level — 1H/4H included — still defines the range, i.e. where Take Profit is capped.
     final trigger = _zoneBounce.findTrigger(
       candles: m15,
       zones: htfZones,
       htfBias: htfStructureBias,
+      candidateZones: [for (final z in htfZones) if (z.source.startsWith('15M')) z],
     );
     if (trigger == null) {
       notes.add('[Range] No clean rejection at the '
-          '${AppConfig.zoneBounceEvaluatedZoneCount} nearest Key Zones this cycle');
+          '${AppConfig.zoneBounceEvaluatedZoneCount} nearest 15M Key Zones this cycle');
       return null;
+    }
+
+    // Hot-volatility gate (2026-10-07, explicit request): a bounce fades a move, and when 15M ATR is well above
+    // its own 3-day norm the move more often keeps going. Checked right after a bounce is found and before
+    // this engine's debounce state is touched, so a blocked scan consumes nothing. No history = no opinion.
+    final heat = atrHeat(m15);
+    final maxHeat = AppConfig.zoneBounceMaxAtrRatio;
+    if (heat != null && heat > maxHeat) {
+      notes.add('[Range] Hot volatility — 15M ATR is ${heat.toStringAsFixed(2)}× its 3-day norm '
+          '(limit ${maxHeat.toStringAsFixed(2)}×) — bounce skipped');
+      _logGuardOnce('rb-heat|${trigger.rejectionCandle.time.toUtc().toIso8601String()}',
+          '⛔ [Range] ${trigger.direction == TradeDirection.buy ? 'BUY' : 'SELL'} bounce skipped: hot volatility '
+          '(15M ATR ${heat.toStringAsFixed(2)}× its 3-day norm, limit ${maxHeat.toStringAsFixed(2)}×)');
+      return null;
+    }
+
+    // Fresh-move gate (2026-10-08, explicit request): do not FADE a sharp move. How far did price run over the
+    // last two hours AGAINST this trade's direction (a BUY bounce fades a fall, a SELL bounce fades a rally)?
+    // Same placement and same guarantees as the gate above: nothing consumed, no history = no opinion.
+    final move = recentMoveAtr(m15);
+    final maxFade = AppConfig.zoneBounceMaxFadeAtr;
+    if (move != null) {
+      final against = trigger.direction == TradeDirection.buy ? -move : move;
+      if (against > maxFade) {
+        final side = trigger.direction == TradeDirection.buy ? 'BUY' : 'SELL';
+        notes.add('[Range] Fading a sharp move — price ran ${against.toStringAsFixed(1)} ATR '
+            '${trigger.direction == TradeDirection.buy ? 'down' : 'up'} in the last 2h '
+            '(limit ${maxFade.toStringAsFixed(1)}) — $side bounce skipped');
+        _logGuardOnce('rb-fade|${trigger.rejectionCandle.time.toUtc().toIso8601String()}',
+            '⛔ [Range] $side bounce skipped: it would fade a sharp move '
+            '(${against.toStringAsFixed(1)} ATR ${trigger.direction == TradeDirection.buy ? 'down' : 'up'} in 2h, '
+            'limit ${maxFade.toStringAsFixed(1)})');
+        return null;
+      }
     }
 
     final candleTime = trigger.rejectionCandle.time;
@@ -1564,8 +2322,7 @@ class SignalChecker {
 
     final zoneKey = trigger.zone.price.toStringAsFixed(2);
     final lastZoneFire = _lastZoneBounceZoneSignalTime[zoneKey];
-    if (lastZoneFire != null &&
-        _now().difference(lastZoneFire) < AppConfig.directionalDebounceWindow) {
+    if (lastZoneFire != null && _now().difference(lastZoneFire) < AppConfig.directionalDebounceWindow) {
       notes.add('[Range] Zone \$$zoneKey already traded within the '
           '${AppConfig.directionalDebounceWindow.inMinutes}-min cooldown');
       return null;
@@ -1617,10 +2374,16 @@ class SignalChecker {
       return null;
     }
 
+    // Default (and the no-config behaviour) stays DXY-exempt; the bridge
+    // config can opt this engine back in with dxy = block.
+    if (StrategyConfig.instance.current.engineDxyMode(EngineIds.rangeBounce) == 'block' &&
+        !await _passesDxyFilter(setup, '[Range] $triggerInfo', notes, EngineIds.rangeBounce)) {
+      return null;
+    }
+
     final withinWindow = _lastZoneBounceSignalDirection != null &&
         _lastZoneBounceSignalDirectionTime != null &&
-        _now().difference(_lastZoneBounceSignalDirectionTime!) <
-            AppConfig.directionalDebounceWindow;
+        _now().difference(_lastZoneBounceSignalDirectionTime!) < AppConfig.directionalDebounceWindow;
     if (withinWindow && setup.direction != _lastZoneBounceSignalDirection) {
       notes.add('[Range] $triggerInfo | Score $score/100 | suppressed — opposes the last '
           'Range Bounce signal within the '
@@ -1629,6 +2392,28 @@ class SignalChecker {
     }
 
     // No DXY gate here by design — see this method's doc comment.
+
+    // Fast-Impulse Guard (2026-10-07): a mean-reversion trade AGAINST a fresh impulse is the one this
+    // engine must not open. Checked last — right before the debounce state below is touched — so a
+    // rejection never burns this engine's candle / zone / direction cooldown, and a SHADOW verdict is
+    // only recorded for a setup that really fires.
+    if (impulseMode != GuardMode.off) {
+      final blocker = impulse.blockerFor(setup.direction);
+      if (blocker != null) {
+        final why = '${blocker.label} — counter-trend ${setup.directionLabel} restricted until '
+            '${formatUtcHm(blocker.restrictUntil)} UTC';
+        final key = 'impulse|$impulseMode|${candleTime.toUtc().toIso8601String()}|${setup.direction.name}';
+        if (impulseMode == GuardMode.block) {
+          notes.add('[Range] $triggerInfo | rejected: Fast-Impulse Guard — $why');
+          _logGuardOnce(key, '⛔ [Range] Fast-Impulse Guard rejected ${setup.directionLabel} @ '
+              '\$${setup.entry.toStringAsFixed(2)}: $why');
+          return null;
+        }
+        setup.addShadowFlag('${ShadowLayer.impulse}: $why');
+        _logGuardOnce(key, '🕶️ [SHADOW] [Range] Fast-Impulse Guard would have rejected ${setup.directionLabel} @ '
+            '\$${setup.entry.toStringAsFixed(2)}: $why');
+      }
+    }
 
     _lastZoneBounceSignalCandleTime = candleTime;
     _lastZoneBounceSignalDirection = setup.direction;
@@ -1691,46 +2476,43 @@ class SignalChecker {
       _ => 15,
     };
 
-    // Zone timeframe (10-30): a 4H level is structurally heavier than a 15M
-    // one. Same instinct as findNearestZone's handicap, but expressed where
-    // it belongs — in the SCORE, where it informs the decision instead of
-    // silently hiding a closer level from evaluation entirely.
-    score += trigger.zone.source.startsWith('4H')
-        ? 30
-        : trigger.zone.source.startsWith('1H')
-            ? 22
-            : 10;
+    // Zone timeframe (0 or 30) — REVERSED 2026-10-07 (explicit request). It used to reward a 4H level
+    // (+30) and a 1H level (+22) over a 15M one (+10), on the instinct that a higher-timeframe level is
+    // structurally heavier. For THIS engine the data says the opposite: over ~12 weeks of real MT5 history
+    // replayed through the real pipeline, Range Bounce off 1H/4H levels lost money in BOTH the
+    // out-of-sample period (09.07-15.09: 70 trades, about 30% wins, -1823 pips) and the recent one
+    // (16.09-07.10: 18 trades, about 22% wins, -644 pips), while 15M levels were the profitable ones
+    // in the recent period (56 trades, 46% wins, +1830 pips). A bounce off a big level is more often the
+    // start of a break than a hold, so the higher timeframes get no credit here and all of the zone
+    // weight goes to 15M. (The ranking between competing candidates is ZoneBounceEngine._rank, not this
+    // score, and is untouched.)
+    score += trigger.zone.source.startsWith('15M') ? 30 : 0;
 
     // How cleanly the wick tested the level (0-20): a wick driven decisively
     // INTO the level and thrown back is a stronger test than a graze.
-    final penetration = (trigger.isBuy
-            ? trigger.zone.price - trigger.rejectionExtreme
-            : trigger.rejectionExtreme - trigger.zone.price)
-        .clamp(0.0, double.infinity);
+    final penetration =
+        (trigger.isBuy ? trigger.zone.price - trigger.rejectionExtreme : trigger.rejectionExtreme - trigger.zone.price)
+            .clamp(0.0, double.infinity);
     score += (penetration / AppConfig.zoneBounceTouchDollars * 20).clamp(0.0, 20.0).round();
 
     // Room to the range's far side (0-20): the share of the full configured
     // target this setup can reach before running into the opposing boundary.
-    final ratioShare = (setup.riskRewardRatio / AppConfig.riskRewardRatio).clamp(0.0, 1.0);
+    final ratioShare = (setup.riskRewardRatio / AppConfig.rrFor(EngineIds.rangeBounce)).clamp(0.0, 1.0);
     score += (ratioShare * 20).round();
 
     return score.clamp(0, 100);
   }
 
-  /// The Opening Range Breakout strategy tier (see orb_engine.dart) — the
-  /// ONLY tier that never reads htfZones, an HTF bias, or a candlestick
-  /// pattern; its own [OrbRange.key]-based "Single Trade per Range" state
-  /// ([_consumedOrbRanges]) plays the role every other tier's candle/zone
-  /// debounce does — set ONLY once a trigger actually fires (survives every
-  /// gate below), never merely because one was found, so a candidate
-  /// rejected this cycle (e.g. score too low, DXY opposed) stays eligible
-  /// for a later cycle rather than burning the range's one shot for nothing.
-  /// Tries each AppConfig-enabled session in declaration order (London
-  /// before New York) and returns the first that fires; a session whose
-  /// range hasn't formed yet, is already consumed, or has no trigger this
-  /// cycle simply falls through to the next.
+  /// The Asia Opening Range Breakout tier (see orb_engine.dart; rebuilt 2026-10-09 as the fifth engine, replacing
+  /// the London/New York ORB) — never reads htfZones, a candlestick pattern or a trend gate: the replayed rules
+  /// had none, and a 4H gate is what the old engine used. Its own [OrbRange.key]-based "Single Trade per Range"
+  /// state ([_consumedOrbRanges]) plays the role every other tier's candle/zone debounce does — set ONLY once a
+  /// trigger actually fires (survives every gate below), never merely because one was found, so a candidate
+  /// rejected this cycle (e.g. stop too wide) stays eligible for a later cycle rather than burning the range's one
+  /// shot for nothing.
   Future<TradeSetup?> _evaluateOrbTrigger({
     required List<Candle> candles5m,
+    required TradeDirection? bias1h,
     required DateTime nowUtc,
     required List<String> notes,
     required double livePrice,
@@ -1741,8 +2523,6 @@ class SignalChecker {
     }
 
     for (final session in OrbSession.values) {
-      if (!session.enabled) continue;
-
       final range = _orb.computeRange(candles5m, session, nowUtc);
       if (range == null) {
         notes.add('[ORB] ${session.label} — Opening Range not formed yet');
@@ -1774,7 +2554,8 @@ class SignalChecker {
       // TIME, so it cannot be relied on to catch this.
       if (!nowUtc.isBefore(_orb.deadline(range))) {
         notes.add('[ORB] ${session.label} range \$${range.low.toStringAsFixed(2)}-\$${range.high.toStringAsFixed(2)} '
-            '— expired (${AppConfig.orbMaxHoursAfterRange}h window closed), no trade today');
+            '— expired (entry window closed at ${AppConfig.orbEntryUntilUtcHour.toString().padLeft(2, '0')}:00 UTC), '
+            'no trade today');
         continue;
       }
 
@@ -1813,7 +2594,7 @@ class SignalChecker {
         continue;
       }
 
-      final score = _orbConfluenceScore(setup);
+      final score = _orbConfluenceScore(trigger, candles5m, bias1h: bias1h);
       setup.confluenceScore = score;
       if (score < AppConfig.minConfluenceScoreOrb) {
         notes.add('[ORB] $triggerInfo | Confluence Score $score/100 — rejected '
@@ -1821,7 +2602,7 @@ class SignalChecker {
         continue;
       }
 
-      if (!await _passesDxyFilter(setup, '[ORB] $triggerInfo', notes)) continue;
+      if (!await _passesDxyFilter(setup, '[ORB] $triggerInfo', notes, EngineIds.orb)) continue;
 
       _consumedOrbRanges.add(range.key);
       _log('✅ [ORB] ${setup.directionLabel} Fired @ \$${setup.entry.toStringAsFixed(2)} '
@@ -1842,8 +2623,9 @@ class SignalChecker {
   /// and Take Profit settings", explicit request). Dynamic by default: SL
   /// sits behind the range's OPPOSITE side (the breakout thesis is only
   /// proven wrong once price has retraced the entire range) plus
-  /// [AppConfig.slBufferDollars], and TP holds the standard
-  /// [AppConfig.riskRewardRatio]; either side switches to a fixed pip
+  /// [AppConfig.slBufferDollars], and TP sits at the engine's own `rr` from the bridge config, or
+  /// [AppConfig.orbRiskRewardDefault] (2.0) without one — never the global default, which the replayed
+  /// Asia ORB did not use; either side switches to a fixed pip
   /// distance from Entry instead when its own AppConfig override is set
   /// (> 0). Returns null on a degenerate (zero) risk distance, mirroring
   /// RiskEngine.buildTradeSetup's own guard.
@@ -1861,9 +2643,10 @@ class SignalChecker {
     if (riskDistance <= 0) return null;
 
     final tpPips = AppConfig.orbTakeProfitPipsOverride;
+    final rr = StrategyConfig.instance.current.engineRiskReward(EngineIds.orb) ?? AppConfig.orbRiskRewardDefault;
     final takeProfit = tpPips > 0
         ? (bullish ? entry + tpPips * TradeSetup.dollarsPerPip : entry - tpPips * TradeSetup.dollarsPerPip)
-        : (bullish ? entry + AppConfig.riskRewardRatio * riskDistance : entry - AppConfig.riskRewardRatio * riskDistance);
+        : (bullish ? entry + rr * riskDistance : entry - rr * riskDistance);
 
     return TradeSetup(
       symbol: AppConfig.symbol,
@@ -1878,17 +2661,38 @@ class SignalChecker {
     );
   }
 
-  /// ORB's own Confluence Score (0-100) — no HTF-bias-alignment component
-  /// at all (ORB deliberately has no bias input to score against), so
-  /// weight instead falls on the mechanical break itself and what it pays.
-  /// A retest is now mandatory for every ORB trigger (2026-09-18, the
-  /// immediate no-retest entry mode was removed), so the retest-confirmed
-  /// bonus is no longer conditional — every fired setup already earns it.
-  int _orbConfluenceScore(TradeSetup setup) {
-    var score = 30; // base: a clean mechanical break of a defined session range is inherently structural
-    score += 45; // every fired ORB setup is now a confirmed retest, materially stronger than a raw breakout
-    if (setup.riskRewardRatio >= AppConfig.riskRewardRatio) score += 25;
-    return score;
+  /// ORB's own Confluence Score (60-100) — INFORMATIONAL since 2026-10-09: every setup that reaches it already met
+  /// all of the replayed rules (break, confirmed retest, stop inside the limits), so the floor of 60 sits above
+  /// [AppConfig.minConfluenceScoreOrb] and the score never rejects; it still varies, so a weaker setup reads weaker.
+  /// The 4H component of the old London/New York ORB is gone with its trend gate.
+  ///   base 60        — confirmed break + mandatory retest
+  ///   1H bias   0-20 — aligned 20, neutral 10, opposed 0
+  ///   range     0-20 — Opening Range height vs 5M ATR(14): ideal 20,
+  ///                    acceptable 10, too narrow/wide 0
+  int _orbConfluenceScore(
+    OrbTrigger trigger,
+    List<Candle> candles5m, {
+    required TradeDirection? bias1h,
+  }) {
+    int alignment(TradeDirection? bias, int aligned, int neutral) =>
+        bias == null ? neutral : (bias == trigger.direction ? aligned : 0);
+
+    var score = 60;
+    score += alignment(bias1h, 20, 10);
+
+    final range = trigger.range;
+    final atr = _ta.averageTrueRange(
+      candles5m.where((c) => c.time.isBefore(range.rangeEnd)).toList(),
+    );
+    if (atr != null && atr > 0) {
+      final heightAtr = (range.high - range.low) / atr;
+      if (heightAtr >= AppConfig.orbIdealRangeMinAtr && heightAtr <= AppConfig.orbIdealRangeMaxAtr) {
+        score += 20;
+      } else if (heightAtr >= AppConfig.orbAcceptableRangeMinAtr && heightAtr <= AppConfig.orbAcceptableRangeMaxAtr) {
+        score += 10;
+      }
+    }
+    return score.clamp(0, 100);
   }
 
   /// The Breakout/Momentum strategy tier (see breakout_momentum_engine.dart)
@@ -2015,7 +2819,13 @@ class SignalChecker {
     }
 
     // --- Spec 7: DXY (score by default, block only on request) ---
-    final dxyMode = AppConfig.breakoutDxyMode;
+    final engineDxy = StrategyConfig.instance.current.engineDxyMode(EngineIds.breakout);
+    final dxyMode = switch (engineDxy) {
+      'block' => 'block',
+      'score' => 'score',
+      'off' || 'exempt' => 'off',
+      _ => AppConfig.breakoutDxyMode,
+    };
     var dxyConfirmed = false;
     if (dxyMode != 'off') {
       dxyConfirmed = await _dxy.confirms(setup.direction);
@@ -2051,7 +2861,7 @@ class SignalChecker {
     // --- Spec 8: News Filter (last gate before entry) ---
     if (AppConfig.breakoutNewsFilterEnabled) {
       final blackout = Duration(minutes: AppConfig.breakoutNewsBlackoutMinutes);
-      final event = await _newsCalendar.blackoutEvent(blackout);
+      final event = await _newsCalendar.blackoutEvent(blackout, now: _now());
       if (event != null) {
         final minutesAway = event.timeUtc.difference(_now().toUtc()).inMinutes;
         notes.add('[Breakout] $triggerInfo | rejected: high-impact USD news blackout — '
@@ -2234,7 +3044,7 @@ class SignalChecker {
     // Clean R:R >= 1:2 (0-25) — hard-enforced by RiskEngine, so this is
     // really "did it actually reach the configured ratio" rather than a
     // free 25 points.
-    if (setup.riskRewardRatio >= AppConfig.riskRewardRatio) score += 25;
+    if (setup.riskRewardRatio >= AppConfig.rrFor(EngineIds.htfRetest)) score += 25;
 
     // Structural SL integrity (25): there's no minimum-SL floor/clamp
     // anymore (2026-09-10 — the user sizes their own lot to the real pip
@@ -2243,6 +3053,27 @@ class SignalChecker {
     score += 25;
 
     return score;
+  }
+
+  /// Consecutive losing trades (negative pips, manual closes included)
+  /// closed today in UTC, counted back from the most recent close. A win or
+  /// break-even ends the streak.
+  int _todayLossStreak(List<TradeSetup> history, DateTime nowUtc) {
+    final startOfDay = DateTime.utc(nowUtc.year, nowUtc.month, nowUtc.day);
+    final closedToday = history
+        .where((s) =>
+            !s.isMissed &&
+            s.outcome != TradeOutcome.open &&
+            s.closedAt != null &&
+            !s.closedAt!.toUtc().isBefore(startOfDay))
+        .toList()
+      ..sort((a, b) => b.closedAt!.compareTo(a.closedAt!));
+    var streak = 0;
+    for (final setup in closedToday) {
+      if ((setup.pips ?? 0) >= 0) break;
+      streak++;
+    }
+    return streak;
   }
 
   /// Simple momentum read over the last ~20 4H candles (~3.3 days): net
@@ -2273,4 +3104,17 @@ class SignalChecker {
         TradeDirection.sell => 'bearish',
         null => 'neutral',
       };
+}
+
+/// Outcome of a manual "Close Trade" request.
+class ManualCloseResult {
+  /// The trade is now closed in the app's history.
+  final bool closed;
+
+  /// The REAL MT5 position was closed by this request.
+  final bool brokerClosed;
+
+  /// A sentence fit to show the user.
+  final String message;
+  const ManualCloseResult({required this.closed, required this.message, this.brokerClosed = false});
 }

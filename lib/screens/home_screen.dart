@@ -8,12 +8,15 @@ import 'package:provider/provider.dart';
 
 import '../config/app_config.dart';
 import '../services/connection_status_service.dart';
+import '../services/pending_store.dart';
 import '../services/signal_monitor.dart';
+import '../widgets/close_trade_flow.dart';
 import '../widgets/signal_card.dart';
 import 'alerts_screen.dart';
 import 'live_chart_screen.dart';
 import 'settings_screen.dart';
 import 'signal_detail_screen.dart';
+import 'strategy_control_screen.dart';
 import 'system_logs_screen.dart';
 import 'trade_history_screen.dart';
 import 'tradingview_chart_screen.dart';
@@ -37,6 +40,7 @@ class HomeScreen extends StatelessWidget {
           PopupMenuButton<_MenuAction>(
             onSelected: (action) {
               final builder = switch (action) {
+                _MenuAction.strategyControl => (BuildContext c) => const StrategyControlScreen(),
                 _MenuAction.liveChart => (BuildContext c) => const LiveChartScreen(),
                 _MenuAction.tradingView => (BuildContext c) => const TradingViewChartScreen(),
                 _MenuAction.systemLogs => (BuildContext c) => const SystemLogsScreen(),
@@ -47,8 +51,14 @@ class HomeScreen extends StatelessWidget {
             },
             itemBuilder: (context) => const [
               PopupMenuItem(
+                key: Key('menu-strategy-control'),
+                value: _MenuAction.strategyControl,
+                child: ListTile(leading: Icon(Icons.tune), title: Text('Strategy Control Center')),
+              ),
+              PopupMenuItem(
                 value: _MenuAction.liveChart,
-                child: ListTile(leading: Icon(Icons.candlestick_chart_outlined), title: Text('Live Chart (signal feed)')),
+                child:
+                    ListTile(leading: Icon(Icons.candlestick_chart_outlined), title: Text('Live Chart (signal feed)')),
               ),
               PopupMenuItem(
                 value: _MenuAction.tradingView,
@@ -79,6 +89,7 @@ class HomeScreen extends StatelessWidget {
       body: Column(
         children: [
           _StatusBar(monitor: monitor),
+          if (monitor.pending.isNotEmpty) _PendingApprovalBanner(approval: monitor.pending.first),
           Expanded(
             child: monitor.history.isEmpty
                 ? _EmptyState(isRunning: monitor.isRunning)
@@ -92,7 +103,7 @@ class HomeScreen extends StatelessWidget {
                         onTap: () => Navigator.of(context).push(
                           MaterialPageRoute(builder: (_) => SignalDetailScreen(setup: setup)),
                         ),
-                        onCloseTrade: () => monitor.closeTradeManually(setup.uid),
+                        onCloseTrade: setup.isMissed ? null : () => confirmAndCloseTrade(context, monitor, setup),
                       );
                     },
                   ),
@@ -109,12 +120,53 @@ class HomeScreen extends StatelessWidget {
   }
 }
 
-enum _MenuAction { liveChart, tradingView, systemLogs, alerts, tradeHistory }
+enum _MenuAction { strategyControl, liveChart, tradingView, systemLogs, alerts, tradeHistory }
 
 /// Running state, symbol/timeframe pills, a pulsing "live" dot while
 /// monitoring is active, the last successful scan timestamp, the live
 /// diagnostic status text, and — only in live (non-mock) mode — an MT5
 /// Bridge connectivity indicator.
+/// Shown while a proposed trade waits for the owner's Approve / Reject on Telegram.
+class _PendingApprovalBanner extends StatelessWidget {
+  final PendingApproval approval;
+  const _PendingApprovalBanner({required this.approval});
+
+  @override
+  Widget build(BuildContext context) {
+    final setup = approval.setup;
+    final until = approval.expiresAt.toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return Container(
+      key: const Key('pending-approval-banner'),
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.amber.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.amber.shade700),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.send_rounded, color: Colors.amber.shade800),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Waiting for your approval on Telegram', style: TextStyle(fontWeight: FontWeight.bold)),
+                Text('${setup.directionLabel} ${setup.symbol} @ ${setup.entry.toStringAsFixed(2)} · '
+                    'SL ${setup.stopLoss.toStringAsFixed(2)} · TP ${setup.takeProfit.toStringAsFixed(2)}\n'
+                    'Decide before ${two(until.hour)}:${two(until.minute)}:${two(until.second)}'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _StatusBar extends StatefulWidget {
   final SignalMonitor monitor;
   const _StatusBar({required this.monitor});
@@ -168,8 +220,7 @@ class _StatusBarState extends State<_StatusBar> with SingleTickerProviderStateMi
                     const SizedBox(width: 6),
                     const _Pill(icon: Icons.token_outlined, label: AppConfig.symbol, color: Color(0xFFD4AF37)),
                     const SizedBox(width: 6),
-                    if (monitor.isRunning)
-                      const _Pill(icon: Icons.bolt, label: '15M', color: Colors.amber),
+                    if (monitor.isRunning) const _Pill(icon: Icons.bolt, label: '15M', color: Colors.amber),
                   ],
                 ),
               ),
@@ -180,7 +231,8 @@ class _StatusBarState extends State<_StatusBar> with SingleTickerProviderStateMi
                   alignment: Alignment.centerRight,
                   child: switch ((AppConfig.useMockData, AppConfig.disableMt5Bridge)) {
                     (true, _) => const Text('MOCK DATA', style: TextStyle(fontSize: 10, color: Colors.orange)),
-                    (false, true) => const Text('STANDALONE', style: TextStyle(fontSize: 10, color: Colors.lightBlueAccent)),
+                    (false, true) =>
+                      const Text('STANDALONE', style: TextStyle(fontSize: 10, color: Colors.lightBlueAccent)),
                     (false, false) => const _BridgeStatusIndicator(),
                   },
                 ),

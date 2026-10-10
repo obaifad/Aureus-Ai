@@ -115,6 +115,32 @@ class TradeSetup {
   /// retired partial-close guard this replaced.
   bool breakEvenSynced;
 
+  /// Revision of the bridge strategy config that was active when this
+  /// setup fired (null for trades from before the config existed, or
+  /// with no bridge) — lets results be attributed to the settings that
+  /// produced them after the config has been edited.
+  int? configRevision;
+
+  /// Net result in account currency (profit + swap + commission) exactly as
+  /// MetaTrader recorded it — set by broker reconciliation, null for
+  /// signal-only trades. The pip figures remain the app's price-based view.
+  double? brokerProfit;
+
+  /// Why the broker closed the position: tp | sl | stop_out | manual | expert | other.
+  String? closeReason;
+
+  /// Set when a proposal sent for Telegram approval ended WITHOUT a trade: expired | rejected | blocked |
+  /// failed. Such a setup is still tracked to its stop or target (so you can see what you missed, or what
+  /// you avoided) but it is NOT a trade: no position backs it, it never counts in the performance stats,
+  /// never blocks a new signal and never offers a Close button. Null for everything that was real.
+  String? notTradedReason;
+
+  /// Market-dynamics safety layers running in SHADOW mode that would have rejected this setup had they
+  /// been enforcing (2026-10-07), each as `<layer>: <why>` — see ShadowLayer. The trade itself went
+  /// ahead untouched; the flags let its real outcome be compared with what the layer would have done.
+  /// Empty for a setup no layer objected to (and for everything persisted before the layers existed).
+  List<String> shadowFlags;
+
   TradeSetup({
     required this.symbol,
     required this.direction,
@@ -139,14 +165,33 @@ class TradeSetup {
     this.partialTpExecuted = false,
     this.partialClosePrice,
     this.breakEvenSynced = false,
+    this.configRevision,
+    this.brokerProfit,
+    this.closeReason,
+    this.notTradedReason,
+    this.shadowFlags = const [],
   });
+
+  /// Records that a shadow-mode layer would have rejected this setup.
+  void addShadowFlag(String flag) => shadowFlags = [...shadowFlags, flag];
+
+  /// True for a signal that was proposed but never traded — see [notTradedReason].
+  bool get isMissed => notTradedReason != null;
+
+  /// Why it was not traded, in words — null for a real trade.
+  String? get notTradedLabel => switch (notTradedReason) {
+        'expired' => 'Approval expired',
+        'rejected' => 'You rejected it',
+        'blocked' => 'Blocked by the bridge',
+        'failed' => 'Order failed',
+        _ => null,
+      };
 
   /// Price at which the trade is 1R in profit — the Break-Even trigger.
   /// Measured from [effectiveEntry] (the REAL broker fill once known), not
   /// the theoretical [entry] — see [actualFillPrice]'s doc comment.
-  double get breakEvenTriggerPrice => direction == TradeDirection.buy
-      ? effectiveEntry + riskDollars
-      : effectiveEntry - riskDollars;
+  double get breakEvenTriggerPrice =>
+      direction == TradeDirection.buy ? effectiveEntry + riskDollars : effectiveEntry - riskDollars;
 
   /// The Stop Loss actually in force right now: [effectiveEntry] once
   /// Break-Even has been triggered, otherwise the original structural
@@ -258,7 +303,7 @@ class TradeSetup {
   /// responsible for persisting the mutated setup (see
   /// SignalChecker.closeTradeManually, which does this via HistoryStore).
   bool closeTradeManually(double currentPrice) {
-    if (outcome != TradeOutcome.open) return false;
+    if (outcome != TradeOutcome.open || isMissed) return false; // a signal nobody traded has nothing to close
     outcome = TradeOutcome.manualClose;
     closedPrice = double.parse(currentPrice.toStringAsFixed(2));
     closedAt = DateTime.now().toUtc();
@@ -266,7 +311,8 @@ class TradeSetup {
   }
 
   /// Stable id for this setup (history de-duplication + notification ids).
-  String get uid => '${setupType.name}|$directionLabel|${entry.toStringAsFixed(2)}|${detectedAt.toUtc().millisecondsSinceEpoch}';
+  String get uid =>
+      '${setupType.name}|$directionLabel|${entry.toStringAsFixed(2)}|${detectedAt.toUtc().millisecondsSinceEpoch}';
 
   /// Positive 31-bit notification id derived from [uid], so two setups fired
   /// in the same second no longer overwrite each other's notification.
@@ -283,8 +329,7 @@ class TradeSetup {
 
   double get riskDollars => (entry - stopLoss).abs();
   double get rewardDollars => (takeProfit - entry).abs();
-  double get riskRewardRatio =>
-      riskDollars == 0 ? 0 : double.parse((rewardDollars / riskDollars).toStringAsFixed(2));
+  double get riskRewardRatio => riskDollars == 0 ? 0 : double.parse((rewardDollars / riskDollars).toStringAsFixed(2));
 
   /// The fraction of the lot Automatic Partial Take-Profit used to close
   /// while that feature existed (2026-09-20 to 2026-09-21, see
@@ -313,8 +358,7 @@ class TradeSetup {
   /// for anything new — a clean binary Break-Even-or-target result.
   double? get _realizedDelta {
     if (closedPrice == null) return null;
-    final finalDelta =
-        direction == TradeDirection.buy ? closedPrice! - effectiveEntry : effectiveEntry - closedPrice!;
+    final finalDelta = direction == TradeDirection.buy ? closedPrice! - effectiveEntry : effectiveEntry - closedPrice!;
     if (!partialTpExecuted) return finalDelta;
     final fillPrice = partialClosePrice ?? breakEvenTriggerPrice;
     final partialDelta = direction == TradeDirection.buy ? fillPrice - effectiveEntry : effectiveEntry - fillPrice;
@@ -354,11 +398,33 @@ class TradeSetup {
     return delta == null ? null : double.parse(delta.toStringAsFixed(2));
   }
 
+  /// Stopped out AT Entry (the retired Break-Even feature): neither a win nor a real loss.
+  bool get isBreakEven => outcome == TradeOutcome.loss && (breakEvenActive || (pips ?? 1).abs() < 0.05);
+
   String get directionLabel => direction == TradeDirection.buy ? 'BUY' : 'SELL';
   String get emoji => direction == TradeDirection.buy ? '🟢' : '🔴';
 
   /// e.g. "1H S/R Retest BUY" — timeframe + structure + direction in one line.
   String get setupLabel => '$timeframeLabel ${setupType.label} $directionLabel';
+
+  /// Why the broker closed the position, in words — null when unknown (signal-only
+  /// trades, or history from before reconciliation existed).
+  String? get closeReasonLabel => switch (closeReason) {
+        'tp' => 'take profit hit',
+        'sl' => 'stop loss hit',
+        'stop_out' => 'broker stop-out',
+        'manual' => 'closed by hand',
+        'expert' => 'closed by the system',
+        'other' => 'closed by the broker',
+        _ => null,
+      };
+
+  /// The broker's net result as text, e.g. "+123.45" / "-67.80" (account currency).
+  String? get brokerProfitLabel {
+    final profit = brokerProfit;
+    if (profit == null) return null;
+    return '${profit >= 0 ? "+" : "-"}${profit.abs().toStringAsFixed(2)}';
+  }
 
   /// UI confidence badge derived from [confluenceScore] (see SignalCard).
   /// Rule 4 (AppConfig.minConfluenceScore, currently 50) already guarantees
@@ -377,8 +443,9 @@ class TradeSetup {
   /// still [TradeOutcome.open].
   String? get outcomeLabel => switch (outcome) {
         TradeOutcome.open => null,
-        TradeOutcome.win => '🎯 TP Hit',
-        TradeOutcome.loss => breakEvenActive ? '⚖️ Break-Even (SL @ Entry)' : '🛑 SL Hit',
+        TradeOutcome.win => isMissed ? '🎯 Would have hit TP' : '🎯 TP Hit',
+        TradeOutcome.loss =>
+          isMissed ? '🛑 Would have hit SL' : (breakEvenActive ? '⚖️ Break-Even (SL @ Entry)' : '🛑 SL Hit'),
         TradeOutcome.manualClose => '✋ Manually Closed',
       };
 
@@ -388,6 +455,7 @@ class TradeSetup {
   /// realizedRiskReward), so it's instant and needs no network round trip.
   /// Null while still [TradeOutcome.open] (nothing to explain yet).
   String? get postMortemReason {
+    if (isMissed) return _missedReason;
     switch (outcome) {
       case TradeOutcome.open:
         return null;
@@ -419,6 +487,7 @@ class TradeSetup {
   /// Deliberately deterministic/rule-based rather than LLM-generated —
   /// this reads instantly for every card in a long history list.
   String? get postMortemAdvice {
+    if (isMissed) return _missedAdvice;
     switch (outcome) {
       case TradeOutcome.open:
         return null;
@@ -450,6 +519,36 @@ class TradeSetup {
     }
   }
 
+  String get _missedPipsText {
+    final value = pips;
+    return value == null ? '' : '${value >= 0 ? "+" : ""}${value.toStringAsFixed(1)} pips';
+  }
+
+  /// What a signal nobody traded went on to do — null while it is still running.
+  String? get _missedReason {
+    if (outcome == TradeOutcome.open) return null;
+    final why = notTradedLabel ?? 'not traded';
+    return outcome == TradeOutcome.win
+        ? 'Not traded ($why). Price went on to hit the Take-Profit — it would have made $_missedPipsText.'
+        : 'Not traded ($why). Price hit the Stop-Loss — skipping it avoided $_missedPipsText.';
+  }
+
+  String? get _missedAdvice {
+    if (outcome == TradeOutcome.open) return null;
+    if (outcome != TradeOutcome.win) return 'Nothing to change: this one would have lost.';
+    return switch (notTradedReason) {
+      'expired' => 'It expired before you answered. Keep the Telegram alerts on, or use Auto mode if you cannot '
+          'answer within the approval window.',
+      'rejected' => 'You rejected a winner. One miss means little; if the reason repeats, make it a rule instead '
+          'of a case-by-case call.',
+      'blocked' => 'The bridge refused it because the price had moved past the window shown in the approval '
+          'message. Answer faster, or widen "Late-approval tolerance" (a worse entry for a bigger chance).',
+      'failed' => 'The broker refused the order — see the Telegram message for the reason (market hours, '
+          'connection, limits).',
+      _ => 'Review why it was not traded.',
+    };
+  }
+
   Map<String, dynamic> toJson() => {
         'symbol': symbol,
         'direction': directionLabel,
@@ -475,6 +574,11 @@ class TradeSetup {
         'partial_tp_executed': partialTpExecuted,
         'partial_close_price': partialClosePrice,
         'break_even_synced': breakEvenSynced,
+        'config_revision': configRevision,
+        'broker_profit': brokerProfit,
+        'close_reason': closeReason,
+        'not_traded_reason': notTradedReason,
+        if (shadowFlags.isNotEmpty) 'shadow_flags': shadowFlags,
       };
 
   /// Mirrors [toJson] — used to rehydrate a TradeSetup sent across an
@@ -507,6 +611,11 @@ class TradeSetup {
       partialTpExecuted: json['partial_tp_executed'] as bool? ?? false,
       partialClosePrice: (json['partial_close_price'] as num?)?.toDouble(),
       breakEvenSynced: json['break_even_synced'] as bool? ?? false,
+      configRevision: (json['config_revision'] as num?)?.toInt(),
+      brokerProfit: (json['broker_profit'] as num?)?.toDouble(),
+      closeReason: json['close_reason'] as String?,
+      notTradedReason: json['not_traded_reason'] as String?,
+      shadowFlags: (json['shadow_flags'] as List?)?.cast<String>() ?? const [],
     );
   }
 }

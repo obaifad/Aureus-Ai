@@ -29,6 +29,7 @@ import 'package:aureus_ai/models/trade_setup.dart';
 import 'package:aureus_ai/services/data_service.dart';
 import 'package:aureus_ai/services/history_store.dart';
 import 'package:aureus_ai/services/signal_checker.dart';
+import 'package:aureus_ai/services/strategy_config_service.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -55,6 +56,8 @@ String buildEnv(String bridgeKeyOut) {
     'BREAKOUT_NEWS_FILTER': 'false',
     'DISABLE_MT5_BRIDGE': 'true',
     'ENABLE_AUTO_TRADING': 'false',
+    // the Fast-Impulse Guard reads 5M too, normally only over the (here disabled) bridge
+    'IMPULSE_FORCE_M5': 'true',
   };
   // BT_ENV="KEY=v,KEY2=v2" applies extra overrides for what-if runs.
   final extra = <String, String>{
@@ -75,22 +78,38 @@ String bridgeKey() {
   return '';
 }
 
+/// BT_TIME_SHIFT_SECONDS is SUBTRACTED from every candle time. The bridge only learns the broker's
+/// UTC offset from live ticks, so a history fetched while the market is closed carries broker time
+/// labelled as UTC; pass the broker's offset (10800 for UTC+3) to put it back on true UTC.
+int get _timeShiftSeconds => int.tryParse(Platform.environment['BT_TIME_SHIFT_SECONDS'] ?? '') ?? 0;
+
+int _envCount(String name, int fallback) => int.tryParse(Platform.environment[name] ?? '') ?? fallback;
+
 Future<List<Candle>> fetch(String key, int tf, int count) async {
-  final uri = Uri.parse('http://127.0.0.1:8000/candles?symbol=XAUUSD...&timeframe=$tf&count=$count');
-  final req = await HttpClient().getUrl(uri);
-  req.headers.set('X-API-Key', key);
-  final res = await req.close();
-  final body = await res.transform(utf8.decoder).join();
-  final list = jsonDecode(body) as List;
+  // BT_M5_FILE / BT_M15_FILE / BT_H1_FILE / BT_H4_FILE=path.json supply a history from a file instead of the
+  // bridge (a /candles dump, or a longer 5M history than the bridge's 2000-bar cap allows).
+  final file = Platform.environment['BT_${const {5: 'M5', 15: 'M15', 60: 'H1', 240: 'H4'}[tf]}_FILE'] ?? '';
+  late final List list;
+  if (file.isNotEmpty) {
+    list = jsonDecode(File(file).readAsStringSync()) as List;
+  } else {
+    final uri = Uri.parse('http://127.0.0.1:8000/candles?symbol=XAUUSD...&timeframe=$tf&count=$count');
+    final req = await HttpClient().getUrl(uri);
+    req.headers.set('X-API-Key', key);
+    final res = await req.close();
+    final body = await res.transform(utf8.decoder).join();
+    list = jsonDecode(body) as List;
+  }
   return [
     for (final c in list)
       Candle(
-        time: DateTime.fromMillisecondsSinceEpoch((c['time'] as num).toInt() * 1000, isUtc: true),
+        time: DateTime.fromMillisecondsSinceEpoch(((c['time'] as num).toInt() - _timeShiftSeconds) * 1000, isUtc: true),
         open: (c['open'] as num).toDouble(),
         high: (c['high'] as num).toDouble(),
         low: (c['low'] as num).toDouble(),
         close: (c['close'] as num).toDouble(),
         volume: (c['tick_volume'] as num?)?.toDouble() ?? 0,
+        spreadPips: (c['spread_pips'] as num?)?.toDouble(),
       ),
   ];
 }
@@ -146,13 +165,23 @@ void main() {
     var unusedKey = '';
     dotenv.testLoad(fileInput: buildEnv(unusedKey));
     SharedPreferences.setMockInitialValues({});
+    // BT_CONFIG=path/to/strategy_config.json replays the exact config a live
+    // bridge would serve (a GET /config body, or the bare config object).
+    final cfgPath = Platform.environment['BT_CONFIG'] ?? '';
+    StrategyConfig.instance.resetForTesting();
+    if (cfgPath.isNotEmpty) {
+      final raw = jsonDecode(File(cfgPath).readAsStringSync()) as Map<String, dynamic>;
+      final body = raw.containsKey('config') ? raw : {'config': raw, 'revision': raw['revision'] ?? 1};
+      StrategyConfig.instance.setSnapshot(StrategyConfigSnapshot.fromResponse(body));
+      print('BT_CONFIG: strategy config revision ${StrategyConfig.instance.current.revision} loaded from $cfgPath');
+    }
     final key = bridgeKey();
 
     // History needed: 300 x 15M / 300 x 1H / 150 x 4H before the first step.
-    final m5All = await fetch(key, 5, 1900);
-    final m15All = await fetch(key, 15, 900);
-    final h1All = await fetch(key, 60, 600);
-    final h4All = await fetch(key, 240, 300);
+    final m5All = await fetch(key, 5, _envCount('BT_M5', 1900));
+    final m15All = await fetch(key, 15, _envCount('BT_M15', 900));
+    final h1All = await fetch(key, 60, _envCount('BT_H1', 600));
+    final h4All = await fetch(key, 240, _envCount('BT_H4', 300));
     final byTf = {5: m5All, 15: m15All, 60: h1All, 240: h4All};
 
     final lastClosed5 = m5All.where((c) => !c.time.add(const Duration(minutes: 5)).isAfter(DateTime.now().toUtc())).last;
@@ -292,6 +321,33 @@ void main() {
           '⟵ ${s.outcome.name.padRight(4)} ${p >= 0 ? "+" : ""}${p.toStringAsFixed(1)}p'
           '${s.closedAt != null ? "  @${hhmm(s.closedAt!.toUtc())}" : ""}'
           '${overlapped.containsKey(s) ? "   ⚠ أثناء: ${overlapped[s]!.map((h) => h.setupType.strategyFamily.label).join("+")}" : ""}');
+    }
+    // ---- market safety layers (2026-10-07): what each layer flagged, and how those trades ended ----
+    print('\n[4] طبقات الأمان (Shadow = تُسجَّل فقط ولا تمنع)  |  impulse=${AppConfig.impulseGuardMode.name} '
+        'chaos=${AppConfig.chaosFilterMode.name} ictSweep=${AppConfig.ictSweepMode.name}');
+    final layers = ['impulse_guard', 'chaos_filter', 'ict_sweep_alignment'];
+    final flagged = history.where((s) => s.shadowFlags.isNotEmpty).toList();
+    final unflagged = history.where((s) => s.shadowFlags.isEmpty).toList();
+    String line(String label, List<TradeSetup> ts) {
+      final w = ts.where((s) => s.outcome == TradeOutcome.win).length;
+      final l = ts.where((s) => s.outcome == TradeOutcome.loss).length;
+      final net = ts.fold<double>(0, (a, s) => a + pipsOf(s));
+      return '  ${label.padRight(34)} صفقات ${ts.length.toString().padLeft(2)} | رابحة $w | خاسرة $l | '
+          'صافي ${net >= 0 ? "+" : ""}${net.toStringAsFixed(1)}p';
+    }
+
+    print(line('بلا أي علامة', unflagged));
+    print(line('عليها علامة (كانت ستُحجب)', flagged));
+    for (final layer in layers) {
+      final ts = history.where((s) => s.shadowFlags.any((f) => f.startsWith('$layer:'))).toList();
+      if (ts.isNotEmpty) print(line('  ← $layer', ts));
+    }
+    for (final s in flagged) {
+      print('  ${hhmm(s.detectedAt.toUtc())} ${s.directionLabel.padRight(4)} ${s.setupType.strategyFamily.label.padRight(11)} '
+          '⟵ ${s.outcome.name.padRight(4)} ${pipsOf(s) >= 0 ? "+" : ""}${pipsOf(s).toStringAsFixed(1)}p');
+      for (final f in s.shadowFlags) {
+        print('        ${f.length > 150 ? f.substring(0, 150) : f}');
+      }
     }
     print('${'=' * 70}\n');
   }, timeout: const Timeout(Duration(minutes: 90)));

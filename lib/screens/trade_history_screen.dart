@@ -15,36 +15,87 @@ class _StrategyStats {
   double? get winRate => (wins + losses) == 0 ? null : wins / (wins + losses) * 100;
 }
 
+/// Signals that were proposed but never traded (approval expired / rejected / blocked): kept apart from the
+/// real statistics, with what they went on to do.
+class _MissedStats {
+  final int total;
+  final int open;
+  final int wouldHaveWon;
+  final int wouldHaveLost;
+  final double netPips;
+  const _MissedStats({
+    required this.total,
+    required this.open,
+    required this.wouldHaveWon,
+    required this.wouldHaveLost,
+    required this.netPips,
+  });
+
+  static _MissedStats from(Iterable<TradeSetup> missed) {
+    final closed = missed.where((s) => s.outcome != TradeOutcome.open);
+    return _MissedStats(
+      total: missed.length,
+      open: missed.where((s) => s.outcome == TradeOutcome.open).length,
+      wouldHaveWon: closed.where((s) => s.outcome == TradeOutcome.win).length,
+      wouldHaveLost: closed.where((s) => s.outcome == TradeOutcome.loss).length,
+      netPips: closed.fold<double>(0, (sum, s) => sum + (s.pips ?? 0)),
+    );
+  }
+}
+
 class _Stats {
   final int total;
   final int open;
   final int wins;
   final int losses;
+  final int breakEven;
+  final int manual;
   final double netPips;
+
+  /// Sum of MT5's net results (account currency) over closed trades that have one;
+  /// null when none do (signal-only history).
+  final double? brokerNet;
   final double todayPips;
   final double weekPips;
   final double avgRiskReward;
   final Map<StrategyFamily, _StrategyStats> byStrategy;
+
+  /// Not part of any figure above — see [_MissedStats].
+  final _MissedStats missed;
 
   const _Stats({
     required this.total,
     required this.open,
     required this.wins,
     required this.losses,
+    required this.breakEven,
+    required this.manual,
     required this.netPips,
+    required this.brokerNet,
     required this.todayPips,
     required this.weekPips,
     required this.avgRiskReward,
     required this.byStrategy,
+    required this.missed,
   });
 
   double? get winRate => (wins + losses) == 0 ? null : wins / (wins + losses) * 100;
 
-  static _Stats from(List<TradeSetup> history) {
+  static _Stats from(List<TradeSetup> all) {
+    // A signal nobody traded is not a trade: every figure below counts real (or at least tracked-as-real)
+    // signals only, and the missed ones get their own line.
+    final history = all.where((s) => !s.isMissed).toList();
+    final missed = _MissedStats.from(all.where((s) => s.isMissed));
     final closed = history.where((s) => s.outcome != TradeOutcome.open);
     final wins = closed.where((s) => s.outcome == TradeOutcome.win).length;
-    final losses = closed.where((s) => s.outcome == TradeOutcome.loss).length;
+    // A stop-out at Entry (Break-Even) is not a real loss, and a manual close is neither: both stay out of
+    // the win rate and are counted on their own.
+    final losses = closed.where((s) => s.outcome == TradeOutcome.loss && !s.isBreakEven).length;
+    final breakEven = closed.where((s) => s.isBreakEven).length;
+    final manual = closed.where((s) => s.outcome == TradeOutcome.manualClose).length;
     final netPips = closed.fold<double>(0, (sum, s) => sum + (s.pips ?? 0));
+    final withBroker = closed.where((s) => s.brokerProfit != null).toList();
+    final brokerNet = withBroker.isEmpty ? null : withBroker.fold<double>(0, (sum, s) => sum + s.brokerProfit!);
 
     // Day/week boundaries anchored to local time so "today"/"this week"
     // match what the trader sees on their device clock, not UTC.
@@ -68,20 +119,24 @@ class _Stats {
       byStrategy[family] = _StrategyStats(
         total: trades.length,
         wins: familyClosed.where((s) => s.outcome == TradeOutcome.win).length,
-        losses: familyClosed.where((s) => s.outcome == TradeOutcome.loss).length,
+        losses: familyClosed.where((s) => s.outcome == TradeOutcome.loss && !s.isBreakEven).length,
       );
     }
 
     return _Stats(
       total: history.length,
-      open: history.length - wins - losses,
+      open: history.where((s) => s.outcome == TradeOutcome.open).length,
+      breakEven: breakEven,
+      manual: manual,
       wins: wins,
       losses: losses,
       netPips: netPips,
+      brokerNet: brokerNet,
       todayPips: todayPips,
       weekPips: weekPips,
       avgRiskReward: avgRR,
       byStrategy: byStrategy,
+      missed: missed,
     );
   }
 }
@@ -101,6 +156,30 @@ class TradeHistoryScreen extends StatefulWidget {
   State<TradeHistoryScreen> createState() => _TradeHistoryScreenState();
 }
 
+Future<void> _confirmClearHistory(BuildContext context, SignalMonitor monitor) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Clear Trade History?'),
+      content: const Text(
+        'This permanently deletes every recorded trade and resets all stats on this '
+        'device. Scanning for new signals will resume right away, as if this device '
+        'had never recorded a trade.',
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+        TextButton(
+          onPressed: () => Navigator.pop(context, true),
+          child: const Text('Clear', style: TextStyle(color: Colors.red)),
+        ),
+      ],
+    ),
+  );
+  if (confirmed == true) {
+    await monitor.clearHistory();
+  }
+}
+
 class _TradeHistoryScreenState extends State<TradeHistoryScreen> {
   // In-memory only (2026-09-18, explicit request): a display preference,
   // not trade data, so it doesn't need to survive alongside the persisted
@@ -118,7 +197,17 @@ class _TradeHistoryScreenState extends State<TradeHistoryScreen> {
     final stats = _Stats.from(history);
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Trade Analytics')),
+      appBar: AppBar(
+        title: const Text('Trade Analytics'),
+        actions: [
+          if (history.isNotEmpty)
+            IconButton(
+              tooltip: 'Clear History',
+              icon: const Icon(Icons.delete_outline),
+              onPressed: () => _confirmClearHistory(context, monitor),
+            ),
+        ],
+      ),
       body: history.isEmpty
           ? const Center(child: Text('No trades recorded yet.'))
           : Column(
@@ -135,6 +224,10 @@ class _TradeHistoryScreenState extends State<TradeHistoryScreen> {
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
                     children: [
                       _SummaryGrid(stats: stats),
+                      if (stats.missed.total > 0) ...[
+                        const SizedBox(height: 10),
+                        _MissedSummary(missed: stats.missed),
+                      ],
                       const SizedBox(height: 20),
                       Text('By Strategy', style: Theme.of(context).textTheme.titleMedium),
                       const SizedBox(height: 8),
@@ -228,10 +321,7 @@ class _CompactHeaderCell extends StatelessWidget {
     return Text(
       text,
       textAlign: alignEnd ? TextAlign.end : TextAlign.start,
-      style: Theme.of(context)
-          .textTheme
-          .labelSmall
-          ?.copyWith(fontWeight: FontWeight.bold, letterSpacing: 0.4),
+      style: Theme.of(context).textTheme.labelSmall?.copyWith(fontWeight: FontWeight.bold, letterSpacing: 0.4),
     );
   }
 }
@@ -243,60 +333,63 @@ class _CompactHistoryRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final pips = setup.pips;
-    final pipsColor = pips == null
-        ? Theme.of(context).colorScheme.onSurfaceVariant
-        : (pips >= 0 ? Colors.green : Colors.red);
+    final pipsColor =
+        pips == null ? Theme.of(context).colorScheme.onSurfaceVariant : (pips >= 0 ? Colors.green : Colors.red);
     final pipsText = pips == null ? '…' : '${pips >= 0 ? "+" : ""}${pips.toStringAsFixed(1)}';
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            flex: 3,
-            child: Text(
-              '${setup.effectiveEntry.toStringAsFixed(2)} → ${setup.closedPrice?.toStringAsFixed(2) ?? "…"}',
-              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+    return Opacity(
+      opacity: setup.isMissed ? 0.6 : 1,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              flex: 3,
+              child: Text(
+                '${setup.effectiveEntry.toStringAsFixed(2)} → ${setup.closedPrice?.toStringAsFixed(2) ?? "…"}',
+                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+              ),
             ),
-          ),
-          Expanded(
-            flex: 3,
-            child: Text(
-              DateFormat('MM/dd HH:mm').format((setup.closedAt ?? setup.detectedAt).toLocal()),
-              style: Theme.of(context).textTheme.bodySmall,
+            Expanded(
+              flex: 3,
+              child: Text(
+                DateFormat('MM/dd HH:mm').format((setup.closedAt ?? setup.detectedAt).toLocal()),
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
             ),
-          ),
-          Expanded(
-            flex: 3,
-            child: Wrap(
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 4,
-              children: [
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(6),
+            Expanded(
+              flex: 3,
+              child: Wrap(
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 4,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      setup.setupType.strategyFamily.label,
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(fontWeight: FontWeight.bold),
+                    ),
                   ),
-                  child: Text(
-                    setup.setupType.strategyFamily.label,
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(fontWeight: FontWeight.bold),
-                  ),
-                ),
-                Text(setup.timeframeLabel, style: Theme.of(context).textTheme.bodySmall),
-              ],
+                  Text(setup.timeframeLabel, style: Theme.of(context).textTheme.bodySmall),
+                  if (setup.isMissed) Text('missed', style: Theme.of(context).textTheme.labelSmall),
+                ],
+              ),
             ),
-          ),
-          Expanded(
-            flex: 2,
-            child: Text(
-              pipsText,
-              textAlign: TextAlign.end,
-              style: TextStyle(fontWeight: FontWeight.bold, color: pipsColor, fontSize: 13),
+            Expanded(
+              flex: 2,
+              child: Text(
+                pipsText,
+                textAlign: TextAlign.end,
+                style: TextStyle(fontWeight: FontWeight.bold, color: pipsColor, fontSize: 13),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -413,7 +506,52 @@ class _SummaryGrid extends StatelessWidget {
           color: stats.netPips >= 0 ? Colors.green : Colors.red,
         ),
         _StatCard(label: 'Avg R:R', value: '1:${stats.avgRiskReward.toStringAsFixed(1)}'),
+        if (stats.breakEven > 0) _StatCard(label: 'Break-even', value: '${stats.breakEven}'),
+        if (stats.manual > 0) _StatCard(label: 'Closed by hand', value: '${stats.manual}'),
+        if (stats.brokerNet != null)
+          _StatCard(
+            label: 'Net P/L (MT5)',
+            value: '${stats.brokerNet! >= 0 ? "+" : "-"}${stats.brokerNet!.abs().toStringAsFixed(2)}',
+            color: stats.brokerNet! >= 0 ? Colors.green : Colors.red,
+          ),
       ],
+    );
+  }
+}
+
+/// One line about the signals that were proposed but never traded: what they went on to do, so a missed
+/// winner (or an avoided loss) is visible instead of silently disappearing.
+class _MissedSummary extends StatelessWidget {
+  final _MissedStats missed;
+  const _MissedSummary({required this.missed});
+
+  @override
+  Widget build(BuildContext context) {
+    final decided = missed.wouldHaveWon + missed.wouldHaveLost;
+    final pipsText = '${missed.netPips >= 0 ? "+" : ""}${missed.netPips.toStringAsFixed(1)} pips';
+    final detail = decided == 0
+        ? '${missed.open} still running'
+        : 'would have been ${missed.wouldHaveWon} win${missed.wouldHaveWon == 1 ? "" : "s"} / '
+            '${missed.wouldHaveLost} loss${missed.wouldHaveLost == 1 ? "" : "es"} · $pipsText'
+            '${missed.open > 0 ? " · ${missed.open} still running" : ""}';
+    return Container(
+      key: const Key('missed-summary'),
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Missed signals (not traded): ${missed.total}', style: Theme.of(context).textTheme.labelMedium),
+          const SizedBox(height: 4),
+          Text(detail, style: Theme.of(context).textTheme.bodySmall),
+          const SizedBox(height: 2),
+          Text('Not included in the figures above.', style: Theme.of(context).textTheme.labelSmall),
+        ],
+      ),
     );
   }
 }
@@ -484,18 +622,22 @@ class _TradeHistoryTileState extends State<_TradeHistoryTile> {
   @override
   Widget build(BuildContext context) {
     final setup = widget.setup;
-    final badgeText = switch (setup.outcome) {
-      TradeOutcome.win => 'WIN',
-      TradeOutcome.loss => 'LOSS',
-      TradeOutcome.open => 'OPEN',
-      TradeOutcome.manualClose => 'CLOSED',
-    };
+    final badgeText = setup.isMissed
+        ? 'MISSED'
+        : switch (setup.outcome) {
+            TradeOutcome.win => 'WIN',
+            TradeOutcome.loss => 'LOSS',
+            TradeOutcome.open => 'OPEN',
+            TradeOutcome.manualClose => 'CLOSED',
+          };
     // Colored by the actual realized pips sign, not the raw outcome
     // (2026-09-21, explicit request — "كل شيء موجب يكون أخضر"): a trade
     // that partial-closed for real profit and then scratched the
     // remainder at Break-Even reads "LOSS" mechanically but is net
     // POSITIVE, so the badge must be green regardless of that label.
-    final badgeColor = setup.outcome == TradeOutcome.open ? Colors.orange : ((setup.pips ?? 0) >= 0 ? Colors.green : Colors.red);
+    final badgeColor = setup.isMissed
+        ? Colors.blueGrey
+        : (setup.outcome == TradeOutcome.open ? Colors.orange : ((setup.pips ?? 0) >= 0 ? Colors.green : Colors.red));
     final hasAnalysis = setup.outcome != TradeOutcome.open;
 
     return Card(
@@ -512,8 +654,10 @@ class _TradeHistoryTileState extends State<_TradeHistoryTile> {
                 children: [
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(color: badgeColor.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
-                    child: Text(badgeText, style: TextStyle(color: badgeColor, fontWeight: FontWeight.bold, fontSize: 11)),
+                    decoration: BoxDecoration(
+                        color: badgeColor.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
+                    child:
+                        Text(badgeText, style: TextStyle(color: badgeColor, fontWeight: FontWeight.bold, fontSize: 11)),
                   ),
                   const SizedBox(width: 10),
                   Expanded(
@@ -526,10 +670,25 @@ class _TradeHistoryTileState extends State<_TradeHistoryTile> {
                           'Entry ${setup.effectiveEntry.toStringAsFixed(2)} → '
                           '${setup.closedPrice?.toStringAsFixed(2) ?? "…"} '
                           '${setup.pips != null ? "(${setup.pips! >= 0 ? "+" : ""}${setup.pips!.toStringAsFixed(1)} pips)" : ""} '
+                          '${setup.brokerProfitLabel != null ? "· MT5 ${setup.brokerProfitLabel} " : ""}'
                           '· ${setup.timeframeLabel} · ${setup.setupType.strategyFamily.label} · '
                           '${DateFormat('MM/dd HH:mm').format(setup.detectedAt.toLocal())}',
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
+                        if (setup.isMissed)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: Text(
+                              'Not traded — ${setup.notTradedLabel} · '
+                              '${switch (setup.outcome) {
+                                TradeOutcome.win => "would have hit TP",
+                                TradeOutcome.loss => "would have hit SL",
+                                _ => "still running",
+                              }}',
+                              key: const Key('missed-line'),
+                              style: Theme.of(context).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                          ),
                       ],
                     ),
                   ),
@@ -582,7 +741,8 @@ class _PostTradeAnalysis extends StatelessWidget {
           ],
           if (reason != null && advice != null) const SizedBox(height: 8),
           if (advice != null)
-            _AnalysisRow(icon: Icons.lightbulb_outline, iconColor: Colors.amber.shade800, label: 'Advice', text: advice),
+            _AnalysisRow(
+                icon: Icons.lightbulb_outline, iconColor: Colors.amber.shade800, label: 'Advice', text: advice),
         ],
       ),
     );

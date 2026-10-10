@@ -7,6 +7,11 @@ class Candle {
   final double close;
   final double volume;
 
+  /// The bar's broker-reported spread in pips ($0.10 on gold), when the data source knows it (the MT5
+  /// bridge does; TwelveData / Yahoo / mock data do not). Context for the volatility / chaos baseline
+  /// only — nothing else reads it.
+  final double? spreadPips;
+
   const Candle({
     required this.time,
     required this.open,
@@ -14,6 +19,7 @@ class Candle {
     required this.low,
     required this.close,
     required this.volume,
+    this.spreadPips,
   });
 
   bool get isBullish => close >= open;
@@ -35,6 +41,7 @@ class Candle {
       low: (json['low'] as num).toDouble(),
       close: (json['close'] as num).toDouble(),
       volume: (json['tick_volume'] ?? json['volume'] ?? 0 as num).toDouble(),
+      spreadPips: (json['spread_pips'] as num?)?.toDouble(),
     );
   }
 
@@ -45,5 +52,6 @@ class Candle {
         'low': low,
         'close': close,
         'volume': volume,
+        if (spreadPips != null) 'spread_pips': spreadPips,
       };
 }

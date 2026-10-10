@@ -88,13 +88,16 @@ class NewsCalendarService {
   /// Returns null on any failure to read the calendar (feed down, no
   /// cache, mock mode), i.e. it never blocks trading just because the news
   /// feed itself is unavailable — same fail-open policy as DxyFilterService.
-  Future<EconomicEvent?> blackoutEvent(Duration blackout) async {
+  ///
+  /// [now] is the caller's clock (SignalChecker's, so a replay or a test judges the window at ITS time); the wall
+  /// clock without one.
+  Future<EconomicEvent?> blackoutEvent(Duration blackout, {DateTime? now}) async {
     try {
       final events = await upcomingHighImpactUsd();
       if (events.isEmpty) return null;
-      final now = DateTime.now().toUtc();
+      final at = (now ?? DateTime.now()).toUtc();
       for (final event in events) {
-        if (event.timeUtc.difference(now).abs() <= blackout) return event;
+        if (event.timeUtc.difference(at).abs() <= blackout) return event;
       }
     } catch (e) {
       AppLogger.log('News calendar: blackout check failed ($e) — not blocking');

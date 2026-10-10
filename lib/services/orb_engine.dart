@@ -4,26 +4,20 @@ import '../config/app_config.dart';
 import '../models/candle.dart';
 import '../models/pivot.dart';
 
-enum OrbSession { london, newYork }
+/// The session ORB trades. Since 2026-10-09 (explicit request: "ضيف المحرك الخامس و قم بحذف ORB القديم") that is
+/// ONLY the Asian open at [AppConfig.orbAsiaOpenUtcHour] (01:00 UTC — Shanghai/Hong Kong open, 09:00 in China, no
+/// daylight-saving shifts). The old London and New York sessions were removed: across every replay of real MT5 history
+/// they lost money on gold (ORB at 07:00/12:00/13:30 UTC was negative in both periods tested), while the 01:00 UTC range
+/// was the one that held up in both.
+enum OrbSession { asia }
 
 extension OrbSessionInfo on OrbSession {
   String get label => switch (this) {
-        OrbSession.london => 'London',
-        OrbSession.newYork => 'New York',
+        OrbSession.asia => 'Asia',
       };
 
-  /// Reuses the exact same UTC session-start constants IctEngine's session
-  /// filter and every other part of this codebase already read — "the
-  /// London session" means the same hour everywhere, not a second,
-  /// independently-tunable number here.
   int get startHourUtc => switch (this) {
-        OrbSession.london => AppConfig.londonSessionStartUtc,
-        OrbSession.newYork => AppConfig.newYorkSessionStartUtc,
-      };
-
-  bool get enabled => switch (this) {
-        OrbSession.london => AppConfig.orbLondonEnabled,
-        OrbSession.newYork => AppConfig.orbNewYorkEnabled,
+        OrbSession.asia => AppConfig.orbAsiaOpenUtcHour,
       };
 }
 
@@ -47,8 +41,7 @@ class OrbRange {
 
   /// Stable per-session-per-day identity — the "Single Trade per Range"
   /// key SignalChecker's debounce state is keyed on (see
-  /// SignalChecker._consumedOrbRanges), so London and New York never share
-  /// one, and a new calendar day always starts a fresh key.
+  /// SignalChecker._consumedOrbRanges), so a new calendar day always starts a fresh key.
   String get key => '${session.name}#${rangeStart.year}-'
       '${rangeStart.month.toString().padLeft(2, '0')}-'
       '${rangeStart.day.toString().padLeft(2, '0')}';
@@ -69,14 +62,18 @@ class OrbTrigger {
   });
 }
 
-/// Standalone Opening Range Breakout strategy (2026-09-18, explicit
-/// request) — deliberately ISOLATED from TaEngine/IctEngine/
-/// ImpulseCorrectionEngine: it never reads an HTF zone, a swing pivot, or a
-/// structure bias, only the raw 5M candles of the session it's watching.
-/// SignalChecker wires it in as a fourth, independent tier with its own
-/// debounce state (see SignalChecker._evaluateOrbTrigger), exactly like
-/// ICT/ICI, and applies the (separate, cross-cutting) DXY Correlation
-/// Filter to its output the same as every other tier's.
+/// Asia Opening Range Breakout (rebuilt 2026-10-09 from the "Pat" ORB study) — deliberately ISOLATED from
+/// TaEngine/IctEngine/ImpulseCorrectionEngine: it never reads an HTF zone, a swing pivot, or a structure bias, only
+/// the raw 5M candles of the Asian open.
+///
+/// The rules: the range is the high/low (wicks included) of the first 15 minutes after 01:00 UTC; the first CLOSED
+/// 5M candle beyond it decides the side; the entry waits for price to come back to the broken edge and close beyond
+/// it again (the retest), and must happen before [AppConfig.orbEntryUntilUtcHour] (07:00 UTC). SignalChecker puts the
+/// Stop Loss behind the range's far side and the Take Profit at [AppConfig.orbRiskRewardDefault] R.
+///
+/// Why this entry: replaying 16 weeks of real MT5 history (22.06-09.10.2026, stops limited to 20-200 pips, 1.5 pip
+/// spread) the confirmed retest beat both a limit order at the edge and an entry at the first touch:
+/// 42 trades, about 62-64 % winners, profit factor about 2.8, against about 1.7 for the limit order.
 class OrbEngine {
   /// Builds today's Opening Range for [session] from [candles5m] — every
   /// CLOSED 5M candle whose open time falls in [session's start, start +
@@ -85,9 +82,7 @@ class OrbEngine {
   /// missing candles inside it (a gap/outage right at the session open) — a
   /// range built from a partial window would be meaningless as tradeable
   /// structure. The required candle count is DERIVED from the configured
-  /// window length rather than hard-coded, so narrowing the window (30 ->
-  /// 15 minutes, 2026-09-24) can't silently leave a stale "6 candles"
-  /// completeness check that no 15-minute window could ever satisfy.
+  /// window length rather than hard-coded.
   OrbRange? computeRange(List<Candle> candles5m, OrbSession session, DateTime nowUtc) {
     final today = DateTime.utc(nowUtc.year, nowUtc.month, nowUtc.day, session.startHourUtc);
     final rangeEnd = today.add(const Duration(minutes: AppConfig.orbRangeMinutes));
@@ -107,12 +102,15 @@ class OrbEngine {
     );
   }
 
-  /// The instant [range] stops being tradeable — [AppConfig.
-  /// orbMaxHoursAfterRange] past the close of its own opening window.
-  /// Exposed on the engine (rather than buried inside [findTrigger]) so
-  /// SignalChecker can say so in its scan notes.
-  DateTime deadline(OrbRange range) =>
-      range.rangeEnd.add(const Duration(hours: AppConfig.orbMaxHoursAfterRange));
+  /// The instant [range] stops being tradeable — [AppConfig.orbEntryUntilUtcHour] (07:00 UTC) on the range's own
+  /// day, i.e. the end of the Asian session, when London's open starts a different market. Exposed on the engine
+  /// (rather than buried inside [findTrigger]) so SignalChecker can say so in its scan notes.
+  DateTime deadline(OrbRange range) => DateTime.utc(
+        range.rangeStart.year,
+        range.rangeStart.month,
+        range.rangeStart.day,
+        AppConfig.orbEntryUntilUtcHour,
+      );
 
   /// Scans the CLOSED 5M candles after [range] — up to its [deadline] —
   /// for a qualifying breakout.
@@ -123,22 +121,16 @@ class OrbEngine {
   /// The ONLY state SignalChecker keeps is which ranges already fired (see
   /// [OrbRange.key]), checked by the caller, not here.
   ///
-  /// "Strictly ignore wicks/shadows" (explicit request): only a CANDLE
-  /// CLOSE beyond the range counts, never an intrabar wick through it.
+  /// Only a CANDLE CLOSE beyond the range counts as the breakout, never an intrabar wick through it.
   ///
-  /// Retest is now mandatory (2026-09-18, explicit request — the immediate,
-  /// no-retest entry mode was removed): the breakout must be followed by a
-  /// genuine retest — price trading back to touch the broken boundary and
-  /// then closing beyond it again — before firing. A close all the way
-  /// back through the range's FAR side invalidates the breakout outright
-  /// (the thesis broke down entirely, not just pulled back) and no trigger
-  /// is ever returned for this range again, even on a later call.
+  /// The retest is mandatory: the breakout must be followed by price trading back to touch the broken edge and
+  /// then closing beyond it again before firing. A close all the way back through the range's FAR side
+  /// invalidates the breakout outright (the thesis broke down entirely, not just pulled back) and no trigger is
+  /// ever returned for this range again, even on a later call.
   ///
-  /// Time-boxed to [deadline] (2026-09-24): candles at or past it are
-  /// dropped BEFORE the scan, so both halves of the setup — the breakout
-  /// and its retest — must complete inside the window. Filtering the
-  /// candles rather than just checking the wall clock means a scan that
-  /// runs late can't reach back and fire off a stale break either.
+  /// Time-boxed to [deadline]: candles at or past it are dropped BEFORE the scan, so both halves of the setup —
+  /// the breakout and its retest — must complete inside the window. Filtering the candles rather than just
+  /// checking the wall clock means a scan that runs late can't reach back and fire off a stale break either.
   OrbTrigger? findTrigger(List<Candle> candles5m, OrbRange range) {
     final expiresAt = deadline(range);
     final after = candles5m

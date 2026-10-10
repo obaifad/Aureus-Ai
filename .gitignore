@@ -52,3 +52,9 @@ bridge/.env
 bridge/__pycache__/
 bridge/*.log
 bridge/venv/
+
+# Bridge runtime state: strategy config, audit log, backups
+bridge/data/
+
+# Per-machine app secrets (never part of a build)
+aureus.local.env

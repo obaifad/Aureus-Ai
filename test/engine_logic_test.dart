@@ -411,8 +411,8 @@ void main() {
 
   group('OrbEngine', () {
     final orb = OrbEngine();
-    // London opens at AppConfig.londonSessionStartUtc (07:00 UTC).
-    final sessionStart = DateTime.utc(2026, 9, 18, 7);
+    // The Asia ORB's range opens at AppConfig.orbAsiaOpenUtcHour (01:00 UTC) — the only session since 2026-10-09.
+    final sessionStart = DateTime.utc(2026, 9, 18, AppConfig.orbAsiaOpenUtcHour);
 
     List<Candle> m5(List<List<double>> ohlc, {DateTime? start}) {
       final t0 = start ?? sessionStart;
@@ -427,11 +427,11 @@ void main() {
         for (var i = 0; i < 6; i++) [2400.0, 2401.0, 2399.0, 2400.0],
       ]);
       // Narrowed to a 15-minute window 2026-09-24 (AppConfig.orbRangeMinutes),
-      // so it closes at 07:15 — 07:14 hasn't reached it yet.
-      final tooEarly = orb.computeRange(candles, OrbSession.london, DateTime.utc(2026, 9, 18, 7, 14));
+      // so it closes at 01:15 — 01:14 hasn't reached it yet.
+      final tooEarly = orb.computeRange(candles, OrbSession.asia, DateTime.utc(2026, 9, 18, 1, 14));
       expect(tooEarly, isNull);
 
-      final ready = orb.computeRange(candles, OrbSession.london, DateTime.utc(2026, 9, 18, 7, 15));
+      final ready = orb.computeRange(candles, OrbSession.asia, DateTime.utc(2026, 9, 18, 1, 15));
       expect(ready, isNotNull);
     });
 
@@ -447,10 +447,10 @@ void main() {
         [2402.0, 2403.0, 2401.0, 2402.0],
         [2402.0, 2420.0, 2380.0, 2410.0],
       ]);
-      final range = orb.computeRange(candles, OrbSession.london, DateTime.utc(2026, 9, 18, 8))!;
+      final range = orb.computeRange(candles, OrbSession.asia, DateTime.utc(2026, 9, 18, 2))!;
       expect(range.high, 2406.0);
       expect(range.low, 2398.0);
-      expect(range.key, 'london#2026-09-18');
+      expect(range.key, 'asia#2026-09-18');
     });
 
     test('computeRange is null on a data gap inside the opening window', () {
@@ -458,11 +458,11 @@ void main() {
       final candles = m5([
         for (var i = 0; i < 2; i++) [2400.0, 2401.0, 2399.0, 2400.0],
       ]);
-      expect(orb.computeRange(candles, OrbSession.london, DateTime.utc(2026, 9, 18, 8)), isNull);
+      expect(orb.computeRange(candles, OrbSession.asia, DateTime.utc(2026, 9, 18, 2)), isNull);
     });
 
     final range = OrbRange(
-      session: OrbSession.london,
+      session: OrbSession.asia,
       rangeStart: sessionStart,
       rangeEnd: sessionStart.add(const Duration(minutes: 15)),
       high: 2405.0,
@@ -517,14 +517,28 @@ void main() {
       expect(orb.findTrigger(after, range), isNull);
     });
 
-    // 2-hour validity window (AppConfig.orbMaxHoursAfterRange, 2026-09-24).
-    // The reviewed session fired a New York ORB entry more than six hours
-    // after its range closed; these pin that shut.
-    test('deadline is orbMaxHoursAfterRange past the end of the range window', () {
-      expect(
-        orb.deadline(range),
-        range.rangeEnd.add(const Duration(hours: AppConfig.orbMaxHoursAfterRange)),
-      );
+    // The entry window ends at the close of the Asian session, AppConfig.orbEntryUntilUtcHour (07:00 UTC) on the
+    // range's own day (2026-10-09; it was a fixed 2 hours after the London/New York ranges).
+    test('deadline is 07:00 UTC on the same day as the range', () {
+      expect(orb.deadline(range), DateTime.utc(2026, 9, 18, AppConfig.orbEntryUntilUtcHour));
+      expect(AppConfig.orbEntryUntilUtcHour, 7);
+      expect(AppConfig.orbAsiaOpenUtcHour, 1);
+    });
+
+    test('only the Asian session is traded — London and New York are gone', () {
+      expect(OrbSession.values, [OrbSession.asia]);
+      expect(OrbSession.asia.startHourUtc, 1);
+      // A London-hours range (07:00) is not built: computeRange reads the 01:00 window only.
+      final london = m5([for (var i = 0; i < 3; i++) [2400.0, 2401.0, 2399.0, 2400.0]], start: DateTime.utc(2026, 9, 18, 7));
+      expect(orb.computeRange(london, OrbSession.asia, DateTime.utc(2026, 9, 18, 8)), isNull);
+    });
+
+    test('a breakout and retest late in the Asian session (05:00 UTC) is still in the window', () {
+      final shapes = [
+        [2403.5, 2407.0, 2403.0, 2406.0], // breakout, closes above 2405
+        [2405.0, 2409.0, 2404.8, 2408.0], // retest + resumption
+      ];
+      expect(orb.findTrigger(m5(shapes, start: DateTime.utc(2026, 9, 18, 5)), range), isNotNull);
     });
 
     test('findTrigger ignores a breakout + retest that completes after the deadline', () {

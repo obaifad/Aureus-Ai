@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../models/pivot.dart';
 import '../models/trade_setup.dart';
 import '../services/signal_monitor.dart';
+import '../widgets/close_trade_flow.dart';
 
 class SignalDetailScreen extends StatelessWidget {
   final TradeSetup setup;
@@ -41,14 +42,44 @@ class SignalDetailScreen extends StatelessWidget {
           _row(context, '🟢 Take Profit', '\$${setup.takeProfit.toStringAsFixed(2)}'),
           _row(context, '📐 Risk : Reward', '1 : ${setup.riskRewardRatio.toStringAsFixed(1)}'),
           _row(context, '🕯️ Confirmation Pattern', setup.pattern.name),
-          if (setup.outcome == TradeOutcome.open) ...[
+          if (setup.outcome == TradeOutcome.open && !setup.isMissed) ...[
             const SizedBox(height: 20),
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
-                onPressed: () => context.read<SignalMonitor>().closeTradeManually(setup.uid),
+                onPressed: () => confirmAndCloseTrade(context, context.read<SignalMonitor>(), setup),
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
                 child: const Text('Close Trade'),
+              ),
+            ),
+          ],
+          if (setup.shadowFlags.isNotEmpty) ...[
+            const SizedBox(height: 20),
+            Container(
+              key: const Key('shadow-flags'),
+              width: double.infinity,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Colors.amber.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.amber.withValues(alpha: 0.5)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('🕶️ Shadow filters', style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Not enforced yet — this trade went ahead, but these safety layers would have blocked it:',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 8),
+                  for (final flag in setup.shadowFlags)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Text('• $flag'),
+                    ),
+                ],
               ),
             ),
           ],

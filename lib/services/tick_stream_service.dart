@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../config/app_config.dart';
@@ -75,17 +76,28 @@ class TickStreamService {
     AppLogger.log(value ? 'Tick stream connected' : 'Tick stream disconnected');
   }
 
+  /// The stream URL carries NO secret: a key in a URL ends up in access logs and
+  /// proxy histories. The key travels in the first message instead.
+  @visibleForTesting
+  static Uri buildUri(String baseUrl, String symbol) {
+    final wsBase = baseUrl.replaceFirst(RegExp(r'^http'), 'ws');
+    return Uri.parse('$wsBase/stream/ticks').replace(queryParameters: {'symbol': symbol});
+  }
+
+  /// First frame the bridge expects on a new connection (it closes the socket
+  /// after a few seconds without it). Null when no key is configured.
+  @visibleForTesting
+  static String? authMessage(String apiKey) =>
+      apiKey.isEmpty ? null : jsonEncode({'type': 'auth', 'api_key': apiKey});
+
   void _open() {
     _reconnectTimer = null;
     if (_disposed) return;
     try {
-      final wsBase = AppConfig.bridgeBaseUrl.replaceFirst(RegExp(r'^http'), 'ws');
-      final uri = Uri.parse('$wsBase/stream/ticks').replace(queryParameters: {
-        'symbol': _symbol,
-        if (AppConfig.bridgeApiKey.isNotEmpty) 'api_key': AppConfig.bridgeApiKey,
-      });
-      final channel = WebSocketChannel.connect(uri);
+      final channel = WebSocketChannel.connect(buildUri(AppConfig.bridgeBaseUrl, _symbol));
       _channel = channel;
+      final auth = authMessage(AppConfig.bridgeApiKey);
+      if (auth != null) channel.sink.add(auth); // queued until the socket is open
       _armWatchdog(); // also bounds a handshake that never completes
 
       // Connection failures surface asynchronously on `ready`, not as a
